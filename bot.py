@@ -382,6 +382,41 @@ def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
 
     return found[:4]
 
+def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[str]:
+    cands = []
+    if not domain or '.' not in domain or len(domain) < 4 or is_search_or_maps(domain) or is_social_host(domain):
+        return []
+
+    first_name = ""
+    last_name = ""
+    for k, v in item.items():
+        lk = k.lower().strip()
+        val = str(v or "").strip()
+        if not val:
+            continue
+        if 'first' in lk and 'name' in lk:
+            first_name = re.sub(r'[^a-zA-Z]', '', val).lower()
+        elif 'last' in lk and 'name' in lk:
+            last_name = re.sub(r'[^a-zA-Z]', '', val).lower()
+        elif any(w in lk for w in ['owner', 'broker', 'contact name', 'full name', 'lead name', 'name']):
+            if lk not in ['company name', 'business name', 'site name', 'file name']:
+                parts = val.split()
+                if len(parts) >= 1:
+                    first_name = re.sub(r'[^a-zA-Z]', '', parts[0]).lower()
+                if len(parts) >= 2:
+                    last_name = re.sub(r'[^a-zA-Z]', '', parts[-1]).lower()
+
+    if first_name and len(first_name) >= 2:
+        cands.append(f"{first_name}@{domain}")
+        if last_name and len(last_name) >= 2:
+            cands.append(f"{first_name}.{last_name}@{domain}")
+            cands.append(f"{first_name[0]}{last_name}@{domain}")
+
+    for role in ['info', 'contact', 'office', 'sales', 'admin', 'hello']:
+        cands.append(f"{role}@{domain}")
+
+    return cands
+
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
     if not url or is_social:
@@ -404,6 +439,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     if ("__cf_chl" in html_content or "cf-browser-verification" in html_content or "Just a moment..." in html_content) and len(html_content) < 12000:
         return None
 
+    site_host = get_hostname(final_url)
     decoded = html.unescape(html_content)
     emails = extract_emails(decoded)
     emails = list(dict.fromkeys(emails + existing_emails))
@@ -419,11 +455,16 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
                 if sub_emails:
                     emails.extend(sub_emails)
 
+    # If no raw email in HTML, generate decision-maker & role candidates
+    if not emails and site_host:
+        domain_cands = generate_domain_candidates(site_host, item)
+        if domain_cands:
+            emails.extend(domain_cands)
+
     if not emails:
         return None
 
     emails = list(dict.fromkeys(emails))
-    site_host = get_hostname(final_url)
     best_email = sorted(emails, key=lambda e: score_email(e, site_host), reverse=True)[0]
 
     phones = extract_phones(decoded, existing_phones)
@@ -677,7 +718,9 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
             "start_time": time.time(),
             "total_rows": total_rows,
             "enriched_results": [],
-            "status_msg_id": status_msg_id
+            "status_msg_id": status_msg_id,
+            "queue": queue,
+            "workers": []
         }
         ACTIVE_JOBS[chat_id] = job_data
 
@@ -701,13 +744,15 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
                 while not queue.empty() and not job_data["is_stopped"]:
                     try:
                         item = queue.get_nowait()
-                    except asyncio.QueueEmpty:
+                    except (asyncio.QueueEmpty, Exception):
                         break
                     try:
                         res = await process_lead(scraper_session, item)
                         if res:
                             job_data["found_count"] += 1
                             job_data["enriched_results"].append(res)
+                    except asyncio.CancelledError:
+                        break
                     except Exception:
                         pass
                     finally:
@@ -715,7 +760,8 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
                         queue.task_done()
 
             workers = [asyncio.create_task(queue_worker()) for _ in range(CONCURRENCY_LIMIT)]
-            await asyncio.gather(*workers)
+            job_data["workers"] = workers
+            await asyncio.gather(*workers, return_exceptions=True)
 
         stop_updater = True
         updater_task.cancel()
