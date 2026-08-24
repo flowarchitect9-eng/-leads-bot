@@ -330,6 +330,19 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> T
             continue
     return None, url
 
+async def fetch_social_page_emails(session: aiohttp.ClientSession, social_url: str) -> List[Tuple[str, str, int]]:
+    if not social_url or not social_url.startswith('http'):
+        return []
+    try:
+        async with session.get(social_url, headers=HEADERS, timeout=SUBPAGE_TIMEOUT, ssl=False) as resp:
+            if resp.status < 400:
+                body = await resp.text(errors='ignore')
+                emails = extract_emails_from_html(html.unescape(body))
+                return [(e, f"Scraped Social: {social_url}", 1050) for e in emails]
+    except Exception:
+        pass
+    return []
+
 async def fetch_search_fallback(session: aiohttp.ClientSession, domain: str, comp_name: str) -> List[Tuple[str, str, int]]:
     results = []
     query = f"site:{domain} email" if domain else f'"{comp_name}" email contact'
@@ -355,41 +368,6 @@ def extract_company_name_from_item(item: Dict[str, str]) -> str:
             if not val.startswith(('http', 'www', '{')):
                 return val
     return ""
-
-def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[Tuple[str, str, int]]:
-    cands = []
-    if not domain or '.' not in domain or len(domain) < 4 or is_search_or_maps(domain) or is_social_host(domain):
-        return []
-
-    first_name = ""
-    last_name = ""
-    for k, v in item.items():
-        lk = k.lower().strip()
-        val = str(v or "").strip()
-        if not val:
-            continue
-        if 'first' in lk and 'name' in lk:
-            first_name = re.sub(r'[^a-zA-Z]', '', val).lower()
-        elif 'last' in lk and 'name' in lk:
-            last_name = re.sub(r'[^a-zA-Z]', '', val).lower()
-        elif any(w in lk for w in ['owner', 'broker', 'contact name', 'full name', 'lead name', 'name']):
-            if lk not in ['company name', 'business name', 'site name', 'file name']:
-                parts = val.split()
-                if len(parts) >= 1:
-                    first_name = re.sub(r'[^a-zA-Z]', '', parts[0]).lower()
-                if len(parts) >= 2:
-                    last_name = re.sub(r'[^a-zA-Z]', '', parts[-1]).lower()
-
-    if first_name and len(first_name) >= 2:
-        cands.append((f"{first_name}@{domain}", f"Decision-Maker Pattern ({first_name})", 60))
-        if last_name and len(last_name) >= 2:
-            cands.append((f"{first_name}.{last_name}@{domain}", f"Decision-Maker Pattern ({first_name}.{last_name})", 70))
-            cands.append((f"{first_name[0]}{last_name}@{domain}", f"Decision-Maker Pattern ({first_name[0]}{last_name})", 65))
-
-    for role in ['info', 'contact', 'sales', 'office', 'admin', 'hello']:
-        cands.append((f"{role}@{domain}", f"Role Pattern ({role}@{domain})", 50))
-
-    return cands
 
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
@@ -490,19 +468,19 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         full_clean_text = clean_text(clean_p)
         location = extract_location(decoded, full_clean_text)
 
-    # 4. Search Engine Cache Fallback
+    # 4. Social Page Scraping Fallback
+    if not email_candidates and (facebook_url or instagram_url):
+        target_social = facebook_url or instagram_url
+        soc_emails = await fetch_social_page_emails(session, target_social)
+        if soc_emails:
+            email_candidates.extend(soc_emails)
+
+    # 5. Search Engine Cache Fallback
     if not email_candidates and site_host:
         comp_n = extract_company_name_from_item(item)
         search_res = await fetch_search_fallback(session, site_host, comp_n)
         if search_res:
             email_candidates.extend(search_res)
-
-    # 5. Live DNS / Domain Synthesizer (Only if domain is live/reachable)
-    if not email_candidates and site_host:
-        is_live = check_domain_mx(site_host)
-        if is_live:
-            domain_cands = generate_domain_candidates(site_host, item)
-            email_candidates.extend(domain_cands)
 
     if not email_candidates:
         return None
