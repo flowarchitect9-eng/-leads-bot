@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import html
+import socket
 import traceback
 import urllib.parse
 from typing import Dict, List, Optional, Tuple, Set
@@ -20,33 +21,37 @@ if sys.platform == "win32":
         pass
 
 # ==============================================================================
-# TURBO CONFIGURATION
+# CONFIGURATION & HIGH PERFORMANCE SETTINGS
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
+CONCURRENCY_LIMIT = 500
 
-CONCURRENCY_LIMIT = 400
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=8.0, connect=4.0, sock_read=5.0)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=6.0, connect=3.5, sock_read=4.0)
-MAX_HTML_SIZE = 3 * 1024 * 1024  # 3MB max as in n8n
-CONTACT_PAGES = ["/contact", "/contact-us", "/about", "/about-us"]
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=6.0, connect=3.0, sock_read=4.0)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0)
+SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=4.0, connect=2.0, sock_read=2.5)
+MAX_HTML_SIZE = 2 * 1024 * 1024
+
+SEARCH_OR_MAPS_HOSTS = {
+    'google.com', 'google.co', 'goo.gl', 'maps.google.com', 'googleusercontent.com',
+    'bing.com', 'yahoo.com', 'duckduckgo.com', 'baidu.com', 'yandex.com'
+}
 
 SOCIAL_HOSTS = {
     'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com',
     'youtu.be', 'twitter.com', 'x.com', 'threads.net', 'linkedin.com',
-    'pinterest.com', 'wa.me', 'whatsapp.com', 'm.me', 'messenger.com'
+    'pinterest.com', 'wa.me', 'whatsapp.com', 'm.me', 'messenger.com', 'yelp.com'
 }
 
 PRIORITY_HEADERS = [
     'homepage url', 'homepage', 'website', 'company website',
     'business website', 'domain', 'destination link(s)', 'destination link', 'landing page'
 ]
-FALLBACK_HEADERS_CONTAINING = ['url', 'website', 'domain', 'link']
 
 GENERIC_PRIORITY = [
     'info@', 'contact@', 'sales@', 'support@', 'hello@', 'admin@', 'office@',
     'inquiry@', 'inquiries@', 'enquiry@', 'help@', 'care@', 'shop@', 'order@', 'orders@'
 ]
-FREE_MAIL_DOMAINS = {'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'live.com'}
+FREE_MAIL_DOMAINS = {'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'live.com', 'aol.com'}
 
 US_STATE_ABBR = r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC"
 RE_US_ADDRESS = re.compile(rf"([A-Za-z .\'-]{{2,40}}),?\s*({US_STATE_ABBR})\s*(\d{{5}})(-\d{{4}})?", re.I)
@@ -57,11 +62,13 @@ RE_TEL_LINK = re.compile(r'tel:([+\d][\d\s\-().]{5,18})', re.I)
 RE_MAILTO = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', re.I)
 RE_CF_EMAIL = re.compile(r'data-cfemail=[\'"]([a-f0-9]+)[\'"]', re.I)
 
-# Track active user jobs so they can be stopped on demand
 ACTIVE_JOBS: Dict[int, Dict] = {}
+IS_PUBLIC_ACTIVE = True
+ADMIN_USER_IDS: Set[int] = set()
+MX_CACHE: Dict[str, bool] = {}
 
 # ==============================================================================
-# FAST EXTRACTION FUNCTIONS
+# HELPER DECODERS & PARSERS
 # ==============================================================================
 def decode_cf_email(encoded: str) -> str:
     try:
@@ -75,12 +82,15 @@ def deobfuscate_text(text: str) -> str:
     return re.sub(r"\s*\[\s*dot\s*\]\s*|\s*\(\s*dot\s*\)\s*|\s+dot\s+", ".", t, flags=re.I)
 
 def clean_text(raw: str) -> str:
-    t = re.sub(r"\[[^\[\]]*\]", " ", raw)
+    t = raw
+    t = re.sub(r"\[[^\[\]]*\]", " ", t)
     t = re.sub(r"(%[0-9A-Fa-f]{2})+", " ", t)
+    t = re.sub(r"%[0-9A-Fa-f]{2}", " ", t)
     t = re.sub(r'\{"[a-zA-Z0-9_]+":[^{}]{0,200}\}', " ", t)
     t = re.sub(r"[a-zA-Z-]+\s*:\s*[^;{}]{1,80};", " ", t)
     t = re.sub(r"\.[a-zA-Z0-9_-]+\s*\{[^}]{0,300}\}", " ", t)
     t = re.sub(r'\\+"', " ", t)
+    t = re.sub(r"&quot;|&amp;|&#\d+;", " ", t)
     t = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", t, flags=re.I)
     t = re.sub(r"[\t\n\r]+", " ", t)
     return re.sub(r"\s{2,}", " ", t).strip()
@@ -92,8 +102,15 @@ def get_hostname(u: str) -> str:
     except Exception:
         return ""
 
+def is_search_or_maps(host: str) -> bool:
+    if not host:
+        return True
+    return any(host == s or host.endswith('.' + s) for s in SEARCH_OR_MAPS_HOSTS)
+
 def is_social_host(host: str) -> bool:
-    return any(host == s or host.endswith("." + s) for s in SOCIAL_HOSTS)
+    if not host:
+        return False
+    return any(host == s or host.endswith('.' + s) for s in SOCIAL_HOSTS)
 
 def normalize_url(raw: str) -> str:
     u = str(raw or "").strip()
@@ -104,179 +121,6 @@ def normalize_url(raw: str) -> str:
     if not re.match(r"^https?://", u, re.I):
         u = "https://" + u
     return u
-
-def extract_title(html_str: str) -> str:
-    m = re.search(r'property=[\'"]og:title[\'"][^>]*content=[\'"]([^\'"]{2,200})[\'"]', html_str, re.I) or \
-        re.search(r'content=[\'"]([^\'"]{2,200})[\'"][^>]*property=[\'"]og:title[\'"]', html_str, re.I) or \
-        re.search(r'name=[\'"]twitter:title[\'"][^>]*content=[\'"]([^\'"]{2,200})[\'"]', html_str, re.I) or \
-        re.search(r'<title[^>]*>([^<]{2,200})</title>', html_str, re.I)
-    if not m:
-        return ""
-    t = html.unescape(m.group(1))
-    t = re.sub(r"<[^>]+>", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s*[\|\-–—]\s*[^|\-–—]{1,40}$", lambda x: "" if len(t) > 60 else x.group(0), t)
-    return t.strip()[:150]
-
-def extract_description(html_str: str) -> str:
-    m = re.search(r'property=[\'"]og:description[\'"][^>]*content=[\'"]([^\'"]{10,})[\'"]', html_str, re.I) or \
-        re.search(r'content=[\'"]([^\'"]{10,})[\'"][^>]*property=[\'"]og:description[\'"]', html_str, re.I) or \
-        re.search(r'<meta[^>]+name=[\'"]description[\'"][^>]+content=[\'"]([^\'"]{10,})[\'"]', html_str, re.I) or \
-        re.search(r'<meta[^>]+content=[\'"]([^\'"]{10,})[\'"][^>]+name=[\'"]description[\'"]', html_str, re.I) or \
-        re.search(r'name=[\'"]twitter:description[\'"][^>]*content=[\'"]([^\'"]{10,})[\'"]', html_str, re.I)
-    if m:
-        desc = html.unescape(m.group(1))
-    else:
-        paragraphs = re.findall(r'<p[^>]*>([^<]{30,})</p>', html_str, re.I)
-        desc = ""
-        for p in paragraphs[:3]:
-            cleaned = clean_text(html.unescape(p))
-            letters = len(re.findall(r'[a-zA-Z]', cleaned))
-            if letters > 20 and (letters / max(len(cleaned), 1)) > 0.5:
-                desc = cleaned
-                break
-    if not desc:
-        return ""
-    desc = clean_text(re.sub(r"<[^>]+>", " ", desc))
-    desc = re.sub(r"[\x00-\x1F\x7F-\x9F]", " ", desc)
-    return re.sub(r"\s+", " ", desc).strip()[:300]
-
-def extract_meta(html_str: str) -> Dict[str, str]:
-    kw_m = re.search(r'name=[\'"]keywords[\'"][^>]*content=[\'"]([^\'"]{2,300})[\'"]', html_str, re.I) or \
-           re.search(r'content=[\'"]([^\'"]{2,300})[\'"][^>]*name=[\'"]keywords[\'"]', html_str, re.I)
-    keywords = clean_text(html.unescape(kw_m.group(1)))[:200] if kw_m else ""
-
-    sn_m = re.search(r'property=[\'"]og:site_name[\'"][^>]*content=[\'"]([^\'"]{1,100})[\'"]', html_str, re.I) or \
-           re.search(r'content=[\'"]([^\'"]{1,100})[\'"][^>]*property=[\'"]og:site_name[\'"]', html_str, re.I)
-    site_name = clean_text(html.unescape(sn_m.group(1)))[:100] if sn_m else ""
-
-    lang_m = re.search(r'<html[^>]+lang=[\'"]([a-zA-Z\-]{2,10})[\'"]', html_str, re.I)
-    language = lang_m.group(1).lower() if lang_m else ""
-
-    return {"keywords": keywords, "site_name": site_name, "language": language}
-
-def clean_phone(p: str) -> Optional[str]:
-    digits = re.sub(r"\D", "", p)
-    if len(digits) < 7 or len(digits) > 14:
-        return None
-    if re.match(r"^0+$", digits) or re.match(r"^(\d)\1+$", digits):
-        return None
-    return re.sub(r"\s+", " ", p.strip())
-
-def extract_emails(html_str: str) -> List[str]:
-    cf_emails = [decode_cf_email(m) for m in RE_CF_EMAIL.findall(html_str)]
-    mailto_emails = RE_MAILTO.findall(html_str)
-    deob = deobfuscate_text(html_str)
-    plain_emails = RE_EMAIL.findall(deob)
-
-    all_emails = set(cf_emails + mailto_emails + plain_emails)
-    valid = []
-    for e in all_emails:
-        e = e.strip().lower()
-        if not e or len(e) < 5:
-            continue
-        if re.search(r"\.(png|jpg|jpeg|gif|svg|webp|css|js|pdf|woff|woff2|ttf)$", e, re.I):
-            continue
-        if re.match(r"^\d+x\d+", e):
-            continue
-        if any(bad in e for bad in ['example.com', 'sentry.io', 'wixpress.com', 'godaddy.com', 'schema.org']):
-            continue
-        if any(e.startswith(bad) for bad in ['test@', 'user@', 'your@', 'name@', 'email@']):
-            continue
-        valid.append(e)
-    return list(dict.fromkeys(valid))
-
-def extract_phones(html_str: str, existing_phones: List[str]) -> List[str]:
-    tel_links = RE_TEL_LINK.findall(html_str)
-    raw_phones = RE_PHONE.findall(html_str)
-    raw_candidates = tel_links + [p[0] if isinstance(p, tuple) else p for p in raw_phones] + existing_phones
-    cleaned = [clean_phone(p) for p in raw_candidates]
-    return list(dict.fromkeys([p for p in cleaned if p]))
-
-def parse_us_address(text: str) -> Optional[Dict[str, str]]:
-    m = RE_US_ADDRESS.search(text)
-    if not m:
-        return None
-    idx = m.start()
-    street_part = text[max(0, idx - 60):idx].strip()
-    sm = RE_STREET.search(street_part)
-    street = sm.group(0).strip() if sm else ""
-    return {
-        "street": street,
-        "city": m.group(1).strip(),
-        "state": m.group(2).upper(),
-        "zip": m.group(3),
-        "country": "US"
-    }
-
-def extract_location(html_str: str, plain_text: str) -> Dict[str, str]:
-    scripts = re.findall(r'<script[^>]*type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>', html_str, re.I | re.S)
-    for s in scripts[:3]:
-        try:
-            data = json.loads(s.strip())
-            items = data if isinstance(data, list) else (data.get("@graph", [data]) if isinstance(data, dict) else [data])
-            for obj in items:
-                if isinstance(obj, dict) and "address" in obj and isinstance(obj["address"], dict):
-                    a = obj["address"]
-                    parts = [a.get("streetAddress", ""), a.get("addressLocality", ""), a.get("addressRegion", ""), a.get("postalCode", "")]
-                    return {
-                        "address_found": ", ".join(filter(None, parts)),
-                        "city": a.get("addressLocality", ""),
-                        "state": a.get("addressRegion", ""),
-                        "zip": a.get("postalCode", ""),
-                        "location_source": "json-ld"
-                    }
-        except Exception:
-            continue
-
-    geo_place = re.search(r'name=[\'"]geo\.placename[\'"][^>]*content=[\'"]([^\'"]{2,100})[\'"]', html_str, re.I)
-    geo_reg = re.search(r'name=[\'"]geo\.region[\'"][^>]*content=[\'"]([^\'"]{2,20})[\'"]', html_str, re.I)
-    if geo_place or geo_reg:
-        city = html.unescape(geo_place.group(1)).strip() if geo_place else ""
-        state = re.sub(r'^[A-Z]{2}-', '', html.unescape(geo_reg.group(1))).strip() if geo_reg else ""
-        return {"address_found": f"{city}, {state}".strip(", "), "city": city, "state": state, "zip": "", "location_source": "meta-geo"}
-
-    addr_m = re.search(r'<address[^>]*>(.*?)</address>', html_str, re.I | re.S)
-    if addr_m:
-        raw_addr = clean_text(html.unescape(re.sub(r"<[^>]+>", " ", addr_m.group(1))))
-        parsed = parse_us_address(raw_addr)
-        if parsed:
-            parts = [parsed["street"], parsed["city"], parsed["state"], parsed["zip"]]
-            return {"address_found": ", ".join(filter(None, parts)), "city": parsed["city"], "state": parsed["state"], "zip": parsed["zip"], "location_source": "address-tag"}
-        if len(raw_addr) >= 5:
-            return {"address_found": raw_addr[:150], "city": "", "state": "", "zip": "", "location_source": "address-tag"}
-
-    parsed = parse_us_address(plain_text)
-    if parsed:
-        parts = [parsed["street"], parsed["city"], parsed["state"], parsed["zip"]]
-        return {"address_found": ", ".join(filter(None, parts)), "city": parsed["city"], "state": parsed["state"], "zip": parsed["zip"], "location_source": "regex-text"}
-
-    return {"address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found"}
-
-def score_email(email: str, site_host: str) -> int:
-    score = 0
-    domain = email.split("@")[1] if "@" in email else ""
-    if site_host and (domain == site_host or domain.endswith("." + site_host) or site_host.endswith("." + domain)):
-        score += 100
-    for idx, p in enumerate(GENERIC_PRIORITY):
-        if email.startswith(p):
-            score += (len(GENERIC_PRIORITY) - idx) * 5
-            break
-    if domain in FREE_MAIL_DOMAINS:
-        score -= 20
-    if re.search(r"noreply|no-reply|donotreply|tracking|newsletter", email, re.I):
-        score -= 50
-    return score
-
-SEARCH_OR_MAPS_HOSTS = {
-    'google.com', 'google.co', 'goo.gl', 'maps.google.com', 'googleusercontent.com',
-    'bing.com', 'yahoo.com', 'duckduckgo.com', 'baidu.com', 'yandex.com'
-}
-
-def is_search_or_maps(host: str) -> bool:
-    if not host:
-        return True
-    return any(host == s or host.endswith('.' + s) for s in SEARCH_OR_MAPS_HOSTS)
 
 def extract_real_target_url(raw_val: str) -> str:
     v = str(raw_val or "").strip()
@@ -322,8 +166,144 @@ def pick_website_url(item: Dict[str, str]) -> Tuple[str, str, bool]:
 
     return "", "", False
 
+def score_email_candidate(email_cand: Tuple[str, str, int], site_host: str) -> int:
+    email, source, base_score = email_cand
+    score = base_score
+    domain = email.split("@")[1] if "@" in email else ""
+    if site_host and (domain == site_host or domain.endswith("." + site_host) or site_host.endswith("." + domain)):
+        score += 150
+    for idx, p in enumerate(GENERIC_PRIORITY):
+        if email.startswith(p):
+            score += (len(GENERIC_PRIORITY) - idx) * 10
+            break
+    if domain in FREE_MAIL_DOMAINS:
+        score -= 40
+    if re.search(r"noreply|no-reply|donotreply|tracking|newsletter", email, re.I):
+        score -= 100
+    return score
+
+def extract_emails_from_html(decoded: str) -> List[str]:
+    cf_emails = [decode_cf_email(m) for m in RE_CF_EMAIL.findall(decoded)]
+    mailto_emails = RE_MAILTO.findall(decoded)
+    deob = deobfuscate_text(decoded)
+    plain_emails = RE_EMAIL.findall(deob)
+
+    all_emails = cf_emails + mailto_emails + plain_emails
+    valid = []
+    for e in all_emails:
+        e = e.strip().lower()
+        if not e or len(e) < 5 or not re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", e):
+            continue
+        if re.search(r"\.(png|jpg|jpeg|gif|svg|webp|css|js|pdf|woff|woff2|ttf)$", e, re.I):
+            continue
+        if re.match(r"^\d+x\d+", e):
+            continue
+        if any(bad in e for bad in ['example.com', 'sentry.io', 'wixpress.com', 'godaddy.com', 'schema.org', 'gravatar.com']):
+            continue
+        if any(e.startswith(bad) for bad in ['test@', 'user@', 'your@', 'name@', 'email@']):
+            continue
+        valid.append(e)
+    return list(dict.fromkeys(valid))
+
+def extract_phones(decoded: str, existing_phones: List[str]) -> List[str]:
+    tel_links = [m.strip() for m in RE_TEL_LINK.findall(decoded)]
+    raw_phones = [p[0] if isinstance(p, tuple) else p for p in RE_PHONE.findall(decoded)]
+    all_cands = tel_links + raw_phones + existing_phones
+    cleaned = []
+    for p in all_cands:
+        digits = re.sub(r"\D", "", p)
+        if 7 <= len(digits) <= 14 and not re.match(r"^0+$", digits) and not re.match(r"^(\d)\1+$", digits):
+            cleaned.append(re.sub(r"\s+", " ", p.strip()))
+    return list(dict.fromkeys(cleaned))
+
+def extract_location(html_str: str, page_text: str) -> Dict[str, str]:
+    scripts = re.findall(r'<script[^>]*type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>', html_str, re.I | re.S)
+    for s in scripts:
+        try:
+            data = json.loads(s.strip())
+            items = data if isinstance(data, list) else (data.get("@graph", [data]) if isinstance(data, dict) else [data])
+            for obj in items:
+                if isinstance(obj, dict) and "address" in obj and isinstance(obj["address"], dict):
+                    a = obj["address"]
+                    parts = [a.get("streetAddress", ""), a.get("addressLocality", ""), a.get("addressRegion", ""), a.get("postalCode", "")]
+                    addr_found = ", ".join(filter(None, parts))
+                    if addr_found:
+                        return {
+                            "address_found": addr_found,
+                            "city": a.get("addressLocality", ""),
+                            "state": a.get("addressRegion", ""),
+                            "zip": a.get("postalCode", ""),
+                            "location_source": "json-ld"
+                        }
+        except Exception:
+            continue
+
+    placename = re.search(r'name=[\'"]geo\.placename[\'"][^>]*content=[\'"]([^\'"]{2,100})[\'"]', html_str, re.I)
+    region = re.search(r'name=[\'"]geo\.region[\'"][^>]*content=[\'"]([^\'"]{2,20})[\'"]', html_str, re.I)
+    if placename or region:
+        city = html.unescape(placename.group(1)).strip() if placename else ""
+        state = re.sub(r'^[A-Z]{2}-', '', html.unescape(region.group(1))).strip() if region else ""
+        return {"address_found": f"{city}, {state}".strip(", "), "city": city, "state": state, "zip": "", "location_source": "meta-geo"}
+
+    m = RE_US_ADDRESS.search(page_text)
+    if m:
+        city_idx = m.start()
+        street_part = page_text[max(0, city_idx - 60):city_idx].strip()
+        sm = RE_STREET.search(street_part)
+        street = sm.group(0).strip() if sm else ""
+        city, state, zip_c = m.group(1).strip(), m.group(2).upper(), m.group(3)
+        parts = [street, city, state, zip_c]
+        return {"address_found": ", ".join(filter(None, parts)), "city": city, "state": state, "zip": zip_c, "location_source": "regex-text"}
+
+    return {"address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found"}
+
+def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
+    found = []
+    base_host = get_hostname(base_url)
+    raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html_str, re.I)
+    keywords = ['contact', 'about', 'team', 'staff', 'reach', 'touch', 'help', 'privacy', 'terms', 'info', 'connect', 'quote', 'broker', 'agent']
+
+    for href in raw_hrefs:
+        href_lower = href.lower()
+        if any(k in href_lower for k in keywords):
+            if href.startswith(('javascript:', 'tel:', 'mailto:', '#', 'whatsapp:')):
+                continue
+            try:
+                abs_url = urllib.parse.urljoin(base_url, href)
+                u_host = get_hostname(abs_url)
+                if (u_host == base_host or not u_host) and not is_social_host(u_host):
+                    if abs_url not in found and abs_url != base_url:
+                        found.append(abs_url)
+            except Exception:
+                pass
+            if len(found) >= 6:
+                break
+
+    for p in ['/contact', '/contact-us', '/about', '/about-us', '/our-team', '/privacy-policy']:
+        try:
+            abs_p = urllib.parse.urljoin(base_url, p)
+            if abs_p not in found and abs_p != base_url:
+                found.append(abs_p)
+        except Exception:
+            pass
+
+    return found[:6]
+
+def check_domain_mx(domain: str) -> bool:
+    if not domain or '.' not in domain:
+        return False
+    if domain in MX_CACHE:
+        return MX_CACHE[domain]
+    try:
+        socket.getaddrinfo(domain, 80, socket.AF_INET, socket.SOCK_STREAM)
+        MX_CACHE[domain] = True
+        return True
+    except Exception:
+        MX_CACHE[domain] = False
+        return False
+
 # ==============================================================================
-# FAST ASYNC SCRAPER
+# FAST ASYNC SCRAPER ENGINE
 # ==============================================================================
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -350,39 +330,33 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> T
             continue
     return None, url
 
-def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
-    found = []
-    base_host = get_hostname(base_url)
-    raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html_str, re.I)
-    keywords = ['contact', 'about', 'team', 'staff', 'reach', 'touch', 'help', 'privacy', 'terms', 'info', 'connect']
-    
-    for href in raw_hrefs:
-        href_lower = href.lower()
-        if any(k in href_lower for k in keywords):
-            if href.startswith(('javascript:', 'tel:', 'mailto:', '#', 'whatsapp:')):
-                continue
-            try:
-                abs_url = urllib.parse.urljoin(base_url, href)
-                u_host = get_hostname(abs_url)
-                if (u_host == base_host or not u_host) and not is_social_host(u_host):
-                    if abs_url not in found and abs_url != base_url:
-                        found.append(abs_url)
-            except Exception:
-                pass
-            if len(found) >= 4:
-                break
+async def fetch_search_fallback(session: aiohttp.ClientSession, domain: str, comp_name: str) -> List[Tuple[str, str, int]]:
+    results = []
+    query = f"site:{domain} email" if domain else f'"{comp_name}" email contact'
+    search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
+    try:
+        async with session.get(search_url, headers=HEADERS, timeout=SEARCH_TIMEOUT, ssl=False) as resp:
+            if resp.status == 200:
+                body = await resp.text(errors='ignore')
+                found = extract_emails_from_html(html.unescape(body))
+                for fe in found:
+                    results.append((fe, f"Search Cache: {query}", 800))
+    except Exception:
+        pass
+    return results
 
-    for p in ['/contact', '/contact-us', '/about', '/about-us']:
-        try:
-            abs_p = urllib.parse.urljoin(base_url, p)
-            if abs_p not in found and abs_p != base_url:
-                found.append(abs_p)
-        except Exception:
-            pass
+def extract_company_name_from_item(item: Dict[str, str]) -> str:
+    for k, v in item.items():
+        lk = k.lower().strip()
+        val = str(v or "").strip()
+        if not val:
+            continue
+        if any(w in lk for w in ['company', 'business name', 'title', 'qbf1pd']):
+            if not val.startswith(('http', 'www', '{')):
+                return val
+    return ""
 
-    return found[:4]
-
-def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[str]:
+def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[Tuple[str, str, int]]:
     cands = []
     if not domain or '.' not in domain or len(domain) < 4 or is_search_or_maps(domain) or is_social_host(domain):
         return []
@@ -407,38 +381,27 @@ def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[str]:
                     last_name = re.sub(r'[^a-zA-Z]', '', parts[-1]).lower()
 
     if first_name and len(first_name) >= 2:
-        cands.append(f"{first_name}@{domain}")
+        cands.append((f"{first_name}@{domain}", f"Decision-Maker Pattern ({first_name})", 60))
         if last_name and len(last_name) >= 2:
-            cands.append(f"{first_name}.{last_name}@{domain}")
-            cands.append(f"{first_name[0]}{last_name}@{domain}")
+            cands.append((f"{first_name}.{last_name}@{domain}", f"Decision-Maker Pattern ({first_name}.{last_name})", 70))
+            cands.append((f"{first_name[0]}{last_name}@{domain}", f"Decision-Maker Pattern ({first_name[0]}{last_name})", 65))
 
-    for role in ['info', 'contact', 'office', 'sales', 'admin', 'hello']:
-        cands.append(f"{role}@{domain}")
+    for role in ['info', 'contact', 'sales', 'office', 'admin', 'hello']:
+        cands.append((f"{role}@{domain}", f"Role Pattern ({role}@{domain})", 50))
 
     return cands
-
-def extract_company_name_from_item(item: Dict[str, str]) -> str:
-    for k, v in item.items():
-        lk = k.lower().strip()
-        val = str(v or "").strip()
-        if not val:
-            continue
-        if any(w in lk for w in ['company', 'business name', 'title', 'qbf1pd']):
-            if not val.startswith(('http', 'www', '{')):
-                return val
-    return ""
 
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
     
-    # 1. Collect all existing emails & phones from incoming row
-    existing_emails = []
+    # 1. Incoming CSV Emails
+    email_candidates: List[Tuple[str, str, int]] = [] # (email, source_url, base_score)
     existing_phones = []
     for k, val in item.items():
         lk = k.lower()
         if 'email' in lk and isinstance(val, str) and '@' in val:
             for em in RE_EMAIL.findall(val):
-                existing_emails.append(em.strip().lower())
+                email_candidates.append((em.strip().lower(), f"Input CSV [{k}]", 1000))
         if 'phone' in lk and isinstance(val, str) and val.strip():
             existing_phones.append(val.strip())
 
@@ -451,7 +414,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
                 site_host = clean_dom + ".com"
                 url = "https://" + site_host
 
-    if not site_host and not existing_emails:
+    if not site_host and not email_candidates:
         return None
 
     html_content = None
@@ -459,7 +422,6 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     if url and not is_social:
         html_content, final_url = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
 
-    emails = list(dict.fromkeys(existing_emails))
     decoded = ""
     title = ""
     description = ""
@@ -476,20 +438,20 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
     if html_content and len(html_content.strip()) >= 10:
         decoded = html.unescape(html_content)
-        scraped_emails = extract_emails(decoded)
-        if scraped_emails:
-            emails.extend(scraped_emails)
+        scraped_emails = extract_emails_from_html(decoded)
+        for se in scraped_emails:
+            email_candidates.append((se, f"Scraped Homepage: {final_url}", 1200))
 
-        # Deep subpage scraping for contact / about / team
-        if not emails:
+        # Deep Subpage Crawling
+        if not email_candidates or len(scraped_emails) == 0:
             contact_urls = discover_contact_urls(final_url, decoded)
             contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
             contact_results = await asyncio.gather(*contact_tasks)
-            for contact_html, _ in contact_results:
+            for contact_html, sub_url in contact_results:
                 if contact_html:
-                    sub_emails = extract_emails(html.unescape(contact_html))
-                    if sub_emails:
-                        emails.extend(sub_emails)
+                    sub_emails = extract_emails_from_html(html.unescape(contact_html))
+                    for sube in sub_emails:
+                        email_candidates.append((sube, f"Scraped Subpage: {sub_url}", 1100))
 
         # Social Profiles
         fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
@@ -512,6 +474,15 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         m_desc = re.search(r'<meta[^>]+name=[\'"]description[\'"][^>]+content=[\'"]([^\'"]{10,})[\'"]', decoded, re.I)
         description = clean_text(html.unescape(og_desc.group(1) if og_desc else (m_desc.group(1) if m_desc else "")))[:300]
 
+        kw = re.search(r'name=[\'"]keywords[\'"][^>]*content=[\'"]([^\'"]{2,300})[\'"]', decoded, re.I)
+        keywords = clean_text(html.unescape(kw.group(1)))[:200] if kw else ""
+
+        sn = re.search(r'property=[\'"]og:site_name[\'"][^>]*content=[\'"]([^\'"]{1,100})[\'"]', decoded, re.I)
+        site_name = clean_text(html.unescape(sn.group(1)))[:100] if sn else ""
+
+        lang = re.search(r'<html[^>]+lang=[\'"]([a-zA-Z\-]{2,10})[\'"]', decoded, re.I)
+        language = lang.group(1).lower() if lang else ""
+
         clean_p = re.sub(r"<script[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
         clean_p = re.sub(r"<style[^>]*>.*?</style>", " ", clean_p, flags=re.I | re.S)
         clean_p = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", clean_p, flags=re.I | re.S)
@@ -519,23 +490,44 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         full_clean_text = clean_text(clean_p)
         location = extract_location(decoded, full_clean_text)
 
-    # If no raw email in HTML, apply Apollo / Clay Decision-Maker & Role Formula
-    if not emails and site_host:
-        domain_cands = generate_domain_candidates(site_host, item)
-        if domain_cands:
-            emails.extend(domain_cands)
+    # 4. Search Engine Cache Fallback
+    if not email_candidates and site_host:
+        comp_n = extract_company_name_from_item(item)
+        search_res = await fetch_search_fallback(session, site_host, comp_n)
+        if search_res:
+            email_candidates.extend(search_res)
 
-    if not emails:
+    # 5. Live DNS / Domain Synthesizer (Only if domain is live/reachable)
+    if not email_candidates and site_host:
+        is_live = check_domain_mx(site_host)
+        if is_live:
+            domain_cands = generate_domain_candidates(site_host, item)
+            email_candidates.extend(domain_cands)
+
+    if not email_candidates:
         return None
 
-    emails = list(dict.fromkeys(emails))
-    best_email = sorted(emails, key=lambda e: score_email(e, site_host), reverse=True)[0]
+    # Deduplicate and sort by score
+    unique_candidates: Dict[str, Tuple[str, str, int]] = {}
+    for cand in email_candidates:
+        em = cand[0].lower().strip()
+        if em not in unique_candidates:
+            unique_candidates[em] = cand
+
+    scored = sorted(unique_candidates.values(), key=lambda c: score_email_candidate(c, site_host), reverse=True)
+    best_cand = scored[0]
+    best_email = best_cand[0]
+    best_source = best_cand[1]
+
+    email_status = "VERIFIED_SCRAPED" if "Scraped" in best_source else ("INPUT_CSV" if "CSV" in best_source else "PATTERN_ACTIVE_DOMAIN")
     best_phone = phones[0] if phones else ""
 
     result = dict(item)
     result.update({
         "email_found": best_email,
-        "all_emails_seen": "; ".join(emails),
+        "email_source": best_source,
+        "email_status": email_status,
+        "all_emails_seen": "; ".join([c[0] for c in scored]),
         "phone_found": best_phone,
         "all_phones_seen": "; ".join(phones),
         "title": title,
@@ -560,7 +552,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     return result
 
 # ==============================================================================
-# TELEGRAM BOT CLIENT
+# TELEGRAM BOT CLIENT & DASHBOARD
 # ==============================================================================
 class TelegramBot:
     def __init__(self, token: str):
@@ -571,10 +563,6 @@ class TelegramBot:
     async def init(self):
         if not self.session:
             self.session = aiohttp.ClientSession()
-
-    async def close(self):
-        if self.session:
-            await self.session.close()
 
     async def send_message(self, chat_id: int, text: str, reply_markup=None, parse_mode: str = "Markdown") -> Optional[int]:
         try:
@@ -634,9 +622,6 @@ class TelegramBot:
         async with self.session.get(download_url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
             return await resp.read()
 
-# ==============================================================================
-# PIPELINE EXECUTION WITH REAL-TIME SPEED & CANCEL BUTTON
-# ==============================================================================
 def render_progress(processed: int, total: int, found: int, start_time: float) -> str:
     pct = round((processed / total) * 100) if total > 0 else 0
     elapsed = max(time.time() - start_time, 0.001)
@@ -644,30 +629,29 @@ def render_progress(processed: int, total: int, found: int, start_time: float) -
     eta_sec = round((total - processed) / rate) if rate > 0 else 0
     eta_text = "almost done..." if processed >= total else (f"{eta_sec // 60}m {eta_sec % 60}s" if eta_sec > 60 else f"{eta_sec}s")
 
-    total_blocks = 12
+    total_blocks = 10
     filled_blocks = round((pct / 100) * total_blocks)
     bar = ""
     for i in range(total_blocks):
         if i < filled_blocks:
-            bar += "🟩" if i < total_blocks * 0.4 else ("🟨" if i < total_blocks * 0.75 else "🟧")
+            bar += "🟩" if i < 4 else ("🟨" if i < 8 else "🟧")
         else:
             bar += "⬜"
 
     stage_emoji = "🏁" if pct >= 100 else ("🔥" if pct >= 75 else ("⚡" if pct >= 50 else ("🔎" if pct >= 25 else "🚀")))
-    success_rate = round((found / processed) * 100) if processed > 0 else 0
-    success_emoji = "🟢" if success_rate >= 50 else ("🟡" if success_rate >= 20 else "🔴")
-    speed_text = f"{rate:.1f} rows/sec" if rate > 0 else "calculating..."
+    success_rate = round((found / max(processed, 1)) * 100)
+    success_emoji = "🟢" if success_rate >= 40 else ("🟡" if success_rate >= 15 else "🔴")
 
     return (
         f"{stage_emoji} *LEAD ENRICHMENT — LIVE STATUS*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{bar}\n"
         f"*{pct}%* Complete\n\n"
-        f"📦 *Processed:* {processed:,} / {total:,}\n"
-        f"📧 *Emails Found:* {found:,}\n"
-        f"{success_emoji} *Success Rate:* {success_rate}%\n"
-        f"⚡ *Realtime Speed:* {speed_text}\n"
-        f"⏱ *ETA:* {eta_text}\n\n"
+        f"📦 *Processed:* `{processed:,}` / `{total:,}`\n"
+        f"📧 *Emails Found:* `{found:,}`\n"
+        f"{success_emoji} *Success Rate:* `{success_rate}%`\n"
+        f"⚡ *Realtime Speed:* `{rate:.1f} rows/sec`\n"
+        f"⏱ *ETA:* `{eta_text}`\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 _Click button below to stop anytime & download_"
     )
@@ -697,7 +681,7 @@ def build_result_csv(enriched_results: List[Dict[str, str]]) -> bytes:
         return b""
 
     PREFERRED_ORDER = [
-        'email_found', 'all_emails_seen', 'phone_found', 'all_phones_seen',
+        'email_found', 'email_source', 'email_status', 'all_emails_seen', 'phone_found', 'all_phones_seen',
         'title', 'description', 'site_name', 'keywords', 'language',
         'address_found', 'city', 'state', 'zip', 'location_source',
         'facebook_url', 'instagram_url', 'linkedin_url', 'twitter_url',
@@ -823,10 +807,10 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         summary_text = (
             f"{status_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📄 *Leads Generated:* {final_count:,} (deduped)\n"
-            f"🔎 *Scanned:* {job_data['processed_count']:,} / {total_rows:,} rows\n"
-            f"⚡ *Avg Speed:* {avg_speed} rows/sec\n"
-            f"⏱ *Total Time:* {elapsed_text}\n\n"
+            f"📄 *Leads Generated:* `{final_count:,}` (deduped)\n"
+            f"🔎 *Scanned:* `{job_data['processed_count']:,}` / `{total_rows:,}` rows\n"
+            f"⚡ *Avg Speed:* `{avg_speed} rows/sec`\n"
+            f"⏱ *Total Time:* `{elapsed_text}`\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📎 *Enriched file attached below* 👇"
         )
@@ -841,9 +825,6 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
 # ==============================================================================
 # OWNER & PUBLIC ACCESS CONTROL SYSTEM
 # ==============================================================================
-IS_PUBLIC_ACTIVE = True
-ADMIN_USER_IDS: Set[int] = set()
-
 def get_admin_panel_markup() -> dict:
     btn_text = "🔴 Turn OFF for Public" if IS_PUBLIC_ACTIVE else "🟢 Turn ON for Public"
     btn_data = "toggle_public_off" if IS_PUBLIC_ACTIVE else "toggle_public_on"
@@ -875,10 +856,10 @@ WELCOME_MESSAGE = (
     "🚀 *High-Speed Lead Enrichment Bot*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "Welcome! Send me any `.csv` file containing websites or domains, and I will extract:\n\n"
-    "📧 *Verified Emails* (Priority scored)\n"
+    "📧 *Verified Emails* (With exact source links)\n"
     "📞 *Phone Numbers*\n"
     "📍 *Physical Addresses / Location*\n"
-    "🌐 *Title, Description & Keywords*\n\n"
+    "🌐 *Title, Description & Socials*\n\n"
     "⚡ *Features:*\n"
     "• Up to 50,000 leads supported\n"
     "• Ultra Turbo speed with live rows/sec\n"
@@ -963,7 +944,19 @@ async def main():
                             if cb_data.startswith("stop_"):
                                 target_chat_id = int(cb_data.split("_")[1])
                                 if target_chat_id in ACTIVE_JOBS:
-                                    ACTIVE_JOBS[target_chat_id]["is_stopped"] = True
+                                    j = ACTIVE_JOBS[target_chat_id]
+                                    j["is_stopped"] = True
+                                    q = j.get("queue")
+                                    if q:
+                                        while not q.empty():
+                                            try:
+                                                q.get_nowait()
+                                                q.task_done()
+                                            except Exception:
+                                                break
+                                    for w in j.get("workers", []):
+                                        if not w.done():
+                                            w.cancel()
                                     await bot.answer_callback_query(cb_id, "Stopping and preparing CSV file...")
                                 else:
                                     await bot.answer_callback_query(cb_id, "Job is not active.")
@@ -995,7 +988,7 @@ async def main():
                         text = (message.get("text") or "").strip()
                         document = message.get("document")
 
-                        # Admin Commands
+                        # Owner Commands
                         if text.lower() in ["/admin", "/owner", "/panel", "/toggle", "/status"]:
                             ADMIN_USER_IDS.add(user_id)
                             await bot.send_message(chat_id, get_admin_panel_text(), reply_markup=get_admin_panel_markup())
@@ -1011,13 +1004,13 @@ async def main():
                             await bot.send_message(chat_id, "🔴 *Bot is now OFF (Maintenance Mode) for the public!*", reply_markup=get_admin_panel_markup())
                             continue
 
-                        # Check Maintenance Mode for non-admins
+                        # Check Maintenance
                         is_admin = (user_id in ADMIN_USER_IDS)
                         if not IS_PUBLIC_ACTIVE and not is_admin:
                             await bot.send_message(chat_id, MAINTENANCE_MESSAGE)
                             continue
 
-                        # File Enrichment
+                        # CSV Processing
                         if document:
                             file_name = document.get("file_name", "").lower()
                             if file_name.endswith(".csv"):
