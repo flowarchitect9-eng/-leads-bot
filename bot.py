@@ -317,6 +317,38 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> T
             continue
     return None, url
 
+def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
+    found = []
+    base_host = get_hostname(base_url)
+    raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html_str, re.I)
+    keywords = ['contact', 'about', 'team', 'staff', 'reach', 'touch', 'help', 'privacy', 'terms', 'info', 'connect']
+    
+    for href in raw_hrefs:
+        href_lower = href.lower()
+        if any(k in href_lower for k in keywords):
+            if href.startswith(('javascript:', 'tel:', 'mailto:', '#', 'whatsapp:')):
+                continue
+            try:
+                abs_url = urllib.parse.urljoin(base_url, href)
+                u_host = get_hostname(abs_url)
+                if (u_host == base_host or not u_host) and not is_social_host(u_host):
+                    if abs_url not in found and abs_url != base_url:
+                        found.append(abs_url)
+            except Exception:
+                pass
+            if len(found) >= 4:
+                break
+
+    for p in ['/contact', '/contact-us', '/about', '/about-us']:
+        try:
+            abs_p = urllib.parse.urljoin(base_url, p)
+            if abs_p not in found and abs_p != base_url:
+                found.append(abs_p)
+        except Exception:
+            pass
+
+    return found[:4]
+
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
     if not url or is_social:
@@ -327,7 +359,8 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     for k, val in item.items():
         lk = k.lower()
         if 'email' in lk and isinstance(val, str) and '@' in val:
-            existing_emails.append(val.strip().lower())
+            for em in RE_EMAIL.findall(val):
+                existing_emails.append(em.strip().lower())
         if 'phone' in lk and isinstance(val, str) and val.strip():
             existing_phones.append(val.strip())
 
@@ -342,16 +375,16 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     emails = extract_emails(decoded)
     emails = list(dict.fromkeys(emails + existing_emails))
 
-    # Check contact/about subpages if homepage has no email
+    # Deep subpage scraping: check discovered /contact, /about, /team, /help links
     if not emails:
-        contact_tasks = [fetch_page(session, urllib.parse.urljoin(final_url, p), SUBPAGE_TIMEOUT) for p in CONTACT_PAGES]
+        contact_urls = discover_contact_urls(final_url, decoded)
+        contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
         contact_results = await asyncio.gather(*contact_tasks)
         for contact_html, _ in contact_results:
             if contact_html:
                 sub_emails = extract_emails(html.unescape(contact_html))
                 if sub_emails:
                     emails.extend(sub_emails)
-                    break
 
     if not emails:
         return None
@@ -671,8 +704,38 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         await bot.edit_message(chat_id, status_msg_id, f"❌ *Error processing file:* `{str(e)[:200]}`")
 
 # ==============================================================================
-# TELEGRAM POLLING LOOP
+# OWNER & PUBLIC ACCESS CONTROL SYSTEM
 # ==============================================================================
+IS_PUBLIC_ACTIVE = True
+ADMIN_USER_IDS: Set[int] = set()
+
+def get_admin_panel_markup() -> dict:
+    btn_text = "🔴 Turn OFF for Public" if IS_PUBLIC_ACTIVE else "🟢 Turn ON for Public"
+    btn_data = "toggle_public_off" if IS_PUBLIC_ACTIVE else "toggle_public_on"
+    return {
+        "inline_keyboard": [
+            [{"text": btn_text, "callback_data": btn_data}],
+            [{"text": "🔄 Refresh Status", "callback_data": "refresh_admin"}]
+        ]
+    }
+
+def get_admin_panel_text() -> str:
+    status_emoji = "🟢 *PUBLIC (ACTIVE)*" if IS_PUBLIC_ACTIVE else "🔴 *OFF (MAINTENANCE MODE)*"
+    return (
+        "👑 *OWNER CONTROL PANEL*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌐 *Bot Access Status:* {status_emoji}\n"
+        f"📊 *Running Jobs:* {len(ACTIVE_JOBS)}\n\n"
+        "_Use the button below to toggle public access on or off anytime:_"
+    )
+
+MAINTENANCE_MESSAGE = (
+    "🛠️ *BOT UNDER MAINTENANCE*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "The Lead Enrichment Bot is currently *OFF* for maintenance by the owner.\n\n"
+    "Please try again later. Thank you for your patience! 🙏"
+)
+
 WELCOME_MESSAGE = (
     "🚀 *High-Speed Lead Enrichment Bot*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -713,11 +776,11 @@ def start_health_thread():
     t.start()
 
 async def main():
+    global IS_PUBLIC_ACTIVE
     loop = asyncio.get_running_loop()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=500)
     loop.set_default_executor(executor)
 
-    # Start healthcheck server for Render
     try:
         start_health_thread()
     except Exception as e:
@@ -738,11 +801,16 @@ async def main():
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
 
-                        # Handle Callback Query (Stop Button)
+                        # Handle Callback Query (Buttons)
                         callback = update.get("callback_query")
                         if callback:
                             cb_id = callback["id"]
                             cb_data = callback.get("data", "")
+                            from_user_id = callback.get("from", {}).get("id")
+                            cb_msg = callback.get("message")
+                            cb_chat_id = cb_msg["chat"]["id"] if cb_msg else from_user_id
+                            cb_msg_id = cb_msg["message_id"] if cb_msg else None
+
                             if cb_data.startswith("stop_"):
                                 target_chat_id = int(cb_data.split("_")[1])
                                 if target_chat_id in ACTIVE_JOBS:
@@ -750,6 +818,23 @@ async def main():
                                     await bot.answer_callback_query(cb_id, "Stopping and preparing CSV file...")
                                 else:
                                     await bot.answer_callback_query(cb_id, "Job is not active.")
+                            elif cb_data == "toggle_public_off":
+                                ADMIN_USER_IDS.add(from_user_id)
+                                IS_PUBLIC_ACTIVE = False
+                                await bot.answer_callback_query(cb_id, "🔴 Bot is now OFF for Public!")
+                                if cb_msg_id:
+                                    await bot.edit_message(cb_chat_id, cb_msg_id, get_admin_panel_text(), reply_markup=get_admin_panel_markup())
+                            elif cb_data == "toggle_public_on":
+                                ADMIN_USER_IDS.add(from_user_id)
+                                IS_PUBLIC_ACTIVE = True
+                                await bot.answer_callback_query(cb_id, "🟢 Bot is now ON for Public!")
+                                if cb_msg_id:
+                                    await bot.edit_message(cb_chat_id, cb_msg_id, get_admin_panel_text(), reply_markup=get_admin_panel_markup())
+                            elif cb_data == "refresh_admin":
+                                ADMIN_USER_IDS.add(from_user_id)
+                                await bot.answer_callback_query(cb_id, "Updated!")
+                                if cb_msg_id:
+                                    await bot.edit_message(cb_chat_id, cb_msg_id, get_admin_panel_text(), reply_markup=get_admin_panel_markup())
                             continue
 
                         message = update.get("message")
@@ -757,15 +842,40 @@ async def main():
                             continue
 
                         chat_id = message["chat"]["id"]
+                        user_id = message.get("from", {}).get("id", chat_id)
+                        text = (message.get("text") or "").strip()
                         document = message.get("document")
 
+                        # Admin Commands
+                        if text.lower() in ["/admin", "/owner", "/panel", "/toggle", "/status"]:
+                            ADMIN_USER_IDS.add(user_id)
+                            await bot.send_message(chat_id, get_admin_panel_text(), reply_markup=get_admin_panel_markup())
+                            continue
+                        elif text.lower() == "/on":
+                            ADMIN_USER_IDS.add(user_id)
+                            IS_PUBLIC_ACTIVE = True
+                            await bot.send_message(chat_id, "🟢 *Bot is now ON for the public!*", reply_markup=get_admin_panel_markup())
+                            continue
+                        elif text.lower() == "/off":
+                            ADMIN_USER_IDS.add(user_id)
+                            IS_PUBLIC_ACTIVE = False
+                            await bot.send_message(chat_id, "🔴 *Bot is now OFF (Maintenance Mode) for the public!*", reply_markup=get_admin_panel_markup())
+                            continue
+
+                        # Check Maintenance Mode for non-admins
+                        is_admin = (user_id in ADMIN_USER_IDS)
+                        if not IS_PUBLIC_ACTIVE and not is_admin:
+                            await bot.send_message(chat_id, MAINTENANCE_MESSAGE)
+                            continue
+
+                        # File Enrichment
                         if document:
                             file_name = document.get("file_name", "").lower()
                             if file_name.endswith(".csv"):
                                 asyncio.create_task(handle_csv_enrichment(bot, chat_id, document["file_id"], file_name))
                             else:
                                 await bot.send_message(chat_id, "❌ *Please upload a valid `.csv` file* with a website/url column.")
-                        elif "text" in message:
+                        elif text:
                             await bot.send_message(chat_id, WELCOME_MESSAGE)
         except Exception:
             await asyncio.sleep(2)
