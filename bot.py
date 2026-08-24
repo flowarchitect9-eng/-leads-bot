@@ -24,11 +24,11 @@ if sys.platform == "win32":
 # CONFIGURATION & HIGH PERFORMANCE SETTINGS
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
-CONCURRENCY_LIMIT = 60
+CONCURRENCY_LIMIT = 180
 
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=10.0, connect=5.0, sock_read=6.0)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=7.0, connect=3.0, sock_read=4.5)
-SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.5, sock_read=3.0)
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=3.5, connect=1.5, sock_read=2.5)
+SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=3.0, connect=1.5, sock_read=2.0)
 MAX_HTML_SIZE = 2 * 1024 * 1024
 
 SEARCH_OR_MAPS_HOSTS = {
@@ -295,6 +295,7 @@ def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
     'Accept-Language': 'en-US,en;q=0.9'
 }
 
