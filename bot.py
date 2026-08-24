@@ -417,11 +417,21 @@ def generate_domain_candidates(domain: str, item: Dict[str, str]) -> List[str]:
 
     return cands
 
+def extract_company_name_from_item(item: Dict[str, str]) -> str:
+    for k, v in item.items():
+        lk = k.lower().strip()
+        val = str(v or "").strip()
+        if not val:
+            continue
+        if any(w in lk for w in ['company', 'business name', 'title', 'qbf1pd']):
+            if not val.startswith(('http', 'www', '{')):
+                return val
+    return ""
+
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
-    if not url or is_social:
-        return None
-
+    
+    # 1. Collect all existing emails & phones from incoming row
     existing_emails = []
     existing_phones = []
     for k, val in item.items():
@@ -432,30 +442,84 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         if 'phone' in lk and isinstance(val, str) and val.strip():
             existing_phones.append(val.strip())
 
-    html_content, final_url = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
-    if not html_content or len(html_content.strip()) < 10:
+    site_host = get_hostname(url) if url else ""
+    if not site_host:
+        comp_name = extract_company_name_from_item(item)
+        if comp_name:
+            clean_dom = re.sub(r'[^a-zA-Z0-9]', '', comp_name).lower()
+            if len(clean_dom) >= 3:
+                site_host = clean_dom + ".com"
+                url = "https://" + site_host
+
+    if not site_host and not existing_emails:
         return None
 
-    if ("__cf_chl" in html_content or "cf-browser-verification" in html_content or "Just a moment..." in html_content) and len(html_content) < 12000:
-        return None
+    html_content = None
+    final_url = url or ""
+    if url and not is_social:
+        html_content, final_url = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
 
-    site_host = get_hostname(final_url)
-    decoded = html.unescape(html_content)
-    emails = extract_emails(decoded)
-    emails = list(dict.fromkeys(emails + existing_emails))
+    emails = list(dict.fromkeys(existing_emails))
+    decoded = ""
+    title = ""
+    description = ""
+    site_name = ""
+    keywords = ""
+    language = ""
+    location = {"address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found"}
+    phones = list(dict.fromkeys(existing_phones))
+    facebook_url = ""
+    instagram_url = ""
+    linkedin_url = ""
+    twitter_url = ""
+    full_clean_text = ""
 
-    # Deep subpage scraping: check discovered /contact, /about, /team, /help links
-    if not emails:
-        contact_urls = discover_contact_urls(final_url, decoded)
-        contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
-        contact_results = await asyncio.gather(*contact_tasks)
-        for contact_html, _ in contact_results:
-            if contact_html:
-                sub_emails = extract_emails(html.unescape(contact_html))
-                if sub_emails:
-                    emails.extend(sub_emails)
+    if html_content and len(html_content.strip()) >= 10:
+        decoded = html.unescape(html_content)
+        scraped_emails = extract_emails_from_html(decoded)
+        if scraped_emails:
+            emails.extend(scraped_emails)
 
-    # If no raw email in HTML, generate decision-maker & role candidates
+        # Deep subpage scraping for contact / about / team
+        if not emails:
+            contact_urls = discover_subpage_urls(final_url, decoded)
+            contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
+            contact_results = await asyncio.gather(*contact_tasks)
+            for contact_html, _ in contact_results:
+                if contact_html:
+                    sub_emails = extract_emails_from_html(html.unescape(contact_html))
+                    if sub_emails:
+                        emails.extend(sub_emails)
+
+        # Social Profiles
+        fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
+        ig_m = re.search(r'href=[\'"](https?://(?:www\.)?instagram\.com/[^\'"]+)[\'"]', decoded, re.I)
+        li_m = re.search(r'href=[\'"](https?://(?:www\.)?linkedin\.com/(?:company|in)/[^\'"]+)[\'"]', decoded, re.I)
+        tw_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\'"]+)[\'"]', decoded, re.I)
+
+        facebook_url = fb_m.group(1).split('?')[0] if fb_m else ""
+        instagram_url = ig_m.group(1).split('?')[0] if ig_m else ""
+        linkedin_url = li_m.group(1).split('?')[0] if li_m else ""
+        twitter_url = tw_m.group(1).split('?')[0] if tw_m else ""
+
+        phones = extract_phones(decoded, existing_phones)
+
+        m_og = re.search(r'property=[\'"]og:title[\'"][^>]*content=[\'"]([^\'"]{2,200})[\'"]', decoded, re.I)
+        m_t = re.search(r'<title[^>]*>([^<]{2,200})</title>', decoded, re.I)
+        title = clean_text(decode_entities(m_og.group(1) if m_og else (m_t.group(1) if m_t else "")))[:150]
+
+        og_desc = re.search(r'property=[\'"]og:description[\'"][^>]*content=[\'"]([^\'"]{10,})[\'"]', decoded, re.I)
+        m_desc = re.search(r'<meta[^>]+name=[\'"]description[\'"][^>]+content=[\'"]([^\'"]{10,})[\'"]', decoded, re.I)
+        description = clean_text(decode_entities(og_desc.group(1) if og_desc else (m_desc.group(1) if m_desc else "")))[:300]
+
+        clean_p = re.sub(r"<script[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
+        clean_p = re.sub(r"<style[^>]*>.*?</style>", " ", clean_p, flags=re.I | re.S)
+        clean_p = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", clean_p, flags=re.I | re.S)
+        clean_p = re.sub(r"<[^>]+>", " ", clean_p)
+        full_clean_text = clean_text(clean_p)
+        location = extract_location(decoded, full_clean_text)
+
+    # If no raw email in HTML, apply Apollo / Clay Decision-Maker & Role Formula
     if not emails and site_host:
         domain_cands = generate_domain_candidates(site_host, item)
         if domain_cands:
@@ -466,20 +530,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
     emails = list(dict.fromkeys(emails))
     best_email = sorted(emails, key=lambda e: score_email(e, site_host), reverse=True)[0]
-
-    phones = extract_phones(decoded, existing_phones)
     best_phone = phones[0] if phones else ""
-
-    title = extract_title(decoded)
-    description = extract_description(decoded)
-    meta = extract_meta(decoded)
-
-    clean_p = re.sub(r"<script[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
-    clean_p = re.sub(r"<style[^>]*>.*?</style>", " ", clean_p, flags=re.I | re.S)
-    clean_p = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", clean_p, flags=re.I | re.S)
-    clean_p = re.sub(r"<[^>]+>", " ", clean_p)
-    full_clean_text = clean_text(clean_p)
-    location = extract_location(decoded, full_clean_text)
 
     # Extract Social Media Profiles
     fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
