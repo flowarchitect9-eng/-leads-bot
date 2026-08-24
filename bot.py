@@ -678,10 +678,30 @@ WELCOME_MESSAGE = (
     "👉 *Simply attach & send your `.csv` file now!*"
 )
 
+async def handle_health(request):
+    return aiohttp.web.Response(text="Bot is running!")
+
+async def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app = aiohttp.web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health check server running on port {port}")
+
 async def main():
     loop = asyncio.get_running_loop()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=500)
     loop.set_default_executor(executor)
+
+    # Start healthcheck server for Render
+    try:
+        await start_web_server()
+    except Exception as e:
+        print(f"Web server notice: {e}")
 
     bot = TelegramBot(TELEGRAM_BOT_TOKEN)
     await bot.init()
