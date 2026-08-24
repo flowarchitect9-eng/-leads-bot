@@ -24,11 +24,11 @@ if sys.platform == "win32":
 # CONFIGURATION & HIGH PERFORMANCE SETTINGS
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
-CONCURRENCY_LIMIT = 500
+CONCURRENCY_LIMIT = 60
 
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=7.0, connect=3.0, sock_read=4.5)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.0, sock_read=3.5)
-SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=4.0, connect=2.0, sock_read=2.5)
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=10.0, connect=5.0, sock_read=6.0)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=7.0, connect=3.0, sock_read=4.5)
+SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.5, sock_read=3.0)
 MAX_HTML_SIZE = 2 * 1024 * 1024
 
 SEARCH_OR_MAPS_HOSTS = {
@@ -749,6 +749,8 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
             "counters": {
                 "phones": 0,
                 "addresses": 0,
+                "new_scraped": 0,
+                "input_csv": 0,
                 "contact_form": 0,
                 "dead_domain": 0,
                 "blocked": 0,
@@ -774,7 +776,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
 
         updater_task = asyncio.create_task(live_progress_loop())
 
-        conn = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, limit_per_host=8, ssl=False, ttl_dns_cache=600, force_close=False)
+        conn = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, limit_per_host=4, ssl=False, ttl_dns_cache=600, force_close=False)
         
         async with aiohttp.ClientSession(connector=conn) as scraper_session:
             async def queue_worker():
@@ -788,6 +790,10 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
                         if res:
                             if res.get("email_found"):
                                 job_data["found_count"] += 1
+                                if res.get("email_status") == "VERIFIED_SCRAPED":
+                                    job_data["counters"]["new_scraped"] += 1
+                                elif res.get("email_status") == "INPUT_CSV":
+                                    job_data["counters"]["input_csv"] += 1
                             job_data["enriched_results"].append(res)
                     except asyncio.CancelledError:
                         break
@@ -823,7 +829,9 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
             f"{status_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📄 *Total Leads Processed:* `{final_count:,}` rows\n"
-            f"📧 *Verified Real Emails:* `{job_data['found_count']:,}`\n"
+            f"📧 *Total Verified Emails:* `{job_data['found_count']:,}`\n"
+            f"   ├ ✨ *New Scraped Emails:* `{c['new_scraped']:,}`\n"
+            f"   └ 📂 *From Input CSV:* `{c['input_csv']:,}`\n\n"
             f"📞 *Phone Numbers:* `{c['phones']:,}`\n"
             f"📍 *Physical Addresses:* `{c['addresses']:,}`\n\n"
             f"🔍 *WEBSITE DIAGNOSTICS:*\n"
@@ -914,15 +922,25 @@ def start_health_thread():
 
 async def keep_alive_pinger():
     port = int(os.environ.get("PORT", 10000))
-    await asyncio.sleep(15)
+    await asyncio.sleep(10)
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(f"http://127.0.0.1:{port}/", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                # 1. Local port ping
+                try:
+                    async with s.get(f"http://127.0.0.1:{port}/", timeout=aiohttp.ClientTimeout(total=4)) as resp1:
+                        pass
+                except Exception:
+                    pass
+                # 2. External HTTPS URL ping
+                try:
+                    async with s.get("https://leads-bot-emzf.onrender.com/", timeout=aiohttp.ClientTimeout(total=8)) as resp2:
+                        pass
+                except Exception:
                     pass
         except Exception:
             pass
-        await asyncio.sleep(240)
+        await asyncio.sleep(45)
 
 async def main():
     global IS_PUBLIC_ACTIVE
