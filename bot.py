@@ -268,19 +268,52 @@ def score_email(email: str, site_host: str) -> int:
         score -= 50
     return score
 
+SEARCH_OR_MAPS_HOSTS = {
+    'google.com', 'google.co', 'goo.gl', 'maps.google.com', 'googleusercontent.com',
+    'bing.com', 'yahoo.com', 'duckduckgo.com', 'baidu.com', 'yandex.com'
+}
+
+def is_search_or_maps(host: str) -> bool:
+    if not host:
+        return True
+    return any(host == s or host.endswith('.' + s) for s in SEARCH_OR_MAPS_HOSTS)
+
+def extract_real_target_url(raw_val: str) -> str:
+    v = str(raw_val or "").strip()
+    if not v:
+        return ""
+    if 'google.' in v and 'adurl=' in v:
+        try:
+            parsed = urllib.parse.urlparse(v)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if 'adurl' in qs and qs['adurl']:
+                target = qs['adurl'][0]
+                if not is_search_or_maps(get_hostname(target)) and not is_social_host(get_hostname(target)):
+                    return normalize_url(target)
+        except Exception:
+            pass
+    if re.match(r"^https?://", v, re.I) or v.startswith("www.") or re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/?", v):
+        norm = normalize_url(v)
+        host = get_hostname(norm)
+        if not is_search_or_maps(host) and not is_social_host(host):
+            return norm
+    return ""
+
 def pick_website_url(item: Dict[str, str]) -> Tuple[str, str, bool]:
     lower_map = {k.lower().strip(): k for k in item.keys()}
     for phfx in PRIORITY_HEADERS:
         if phfx in lower_map:
-            val = normalize_url(item[lower_map[phfx]])
-            if val and not is_social_host(get_hostname(val)):
+            val = extract_real_target_url(item[lower_map[phfx]])
+            if val:
                 return val, lower_map[phfx], False
 
-    candidates = [k for k in item.keys() if k.lower().strip() != 'page url' and any(f in k.lower() for f in FALLBACK_HEADERS_CONTAINING)]
-    for c in candidates:
-        val = normalize_url(item[c])
-        if val and not is_social_host(get_hostname(val)):
-            return val, c, False
+    for k, raw_v in item.items():
+        lk = k.lower().strip()
+        if 'page url' in lk or 'profile' in lk:
+            continue
+        val = extract_real_target_url(raw_v)
+        if val:
+            return val, k, False
 
     if 'page url' in lower_map:
         val = normalize_url(item[lower_map['page url']])
@@ -609,12 +642,12 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         total_rows = min(len(rows), 50000)
         rows = rows[:total_rows]
 
-        has_website_col = any(
-            any(k in col.lower() for k in ['website', 'url', 'domain', 'link'])
+        has_website_col = any(pick_website_url(r)[0] for r in rows[:15]) or any(
+            any(k in col.lower() for k in ['website', 'url', 'domain', 'link', 'href', 'site'])
             for col in rows[0].keys()
         )
         if not has_website_col:
-            await bot.edit_message(chat_id, status_msg_id, "❌ *Error:* No `website` / `url` / `domain` column found in your CSV file!")
+            await bot.edit_message(chat_id, status_msg_id, "❌ *Error:* No website or domain links found in your CSV file!")
             return
 
         queue = asyncio.Queue()
