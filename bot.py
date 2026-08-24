@@ -26,8 +26,8 @@ if sys.platform == "win32":
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
 CONCURRENCY_LIMIT = 500
 
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=6.0, connect=3.0, sock_read=4.0)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0)
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=7.0, connect=3.0, sock_read=4.5)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.0, sock_read=3.5)
 SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=4.0, connect=2.0, sock_read=2.5)
 MAX_HTML_SIZE = 2 * 1024 * 1024
 
@@ -289,19 +289,6 @@ def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
 
     return found[:6]
 
-def check_domain_mx(domain: str) -> bool:
-    if not domain or '.' not in domain:
-        return False
-    if domain in MX_CACHE:
-        return MX_CACHE[domain]
-    try:
-        socket.getaddrinfo(domain, 80, socket.AF_INET, socket.SOCK_STREAM)
-        MX_CACHE[domain] = True
-        return True
-    except Exception:
-        MX_CACHE[domain] = False
-        return False
-
 # ==============================================================================
 # FAST ASYNC SCRAPER ENGINE
 # ==============================================================================
@@ -311,24 +298,35 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9'
 }
 
-async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str]:
+async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str, str]:
+    """Returns (html_content, final_url, status_diag)"""
     attempts = [url]
     if url.startswith("https://"):
         attempts.append(url.replace("https://", "http://"))
 
+    last_diag = "CONNECTION_FAILED"
     for u in attempts:
         try:
             async with session.get(u, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
-                if resp.status < 400:
+                if resp.status == 200:
                     ct = resp.headers.get("Content-Type", "").lower()
                     if "text/html" in ct or "application/xhtml" in ct or not ct:
                         content = await resp.read()
                         if len(content) > MAX_HTML_SIZE:
                             content = content[:MAX_HTML_SIZE]
-                        return content.decode("utf-8", errors="ignore"), str(resp.url)
-        except Exception:
-            continue
-    return None, url
+                        return content.decode("utf-8", errors="ignore"), str(resp.url), "SUCCESS"
+                elif resp.status in (403, 503):
+                    last_diag = "BLOCKED_CLOUDFLARE_403"
+                else:
+                    last_diag = f"HTTP_{resp.status}"
+        except asyncio.TimeoutError:
+            last_diag = "TIMEOUT"
+        except Exception as e:
+            if "getaddrinfo" in str(e).lower() or "dns" in str(e).lower():
+                last_diag = "DEAD_EXPIRED_DOMAIN"
+            else:
+                last_diag = "CONNECTION_FAILED"
+    return None, url, last_diag
 
 async def fetch_social_page_emails(session: aiohttp.ClientSession, social_url: str) -> List[Tuple[str, str, int]]:
     if not social_url or not social_url.startswith('http'):
@@ -369,11 +367,11 @@ def extract_company_name_from_item(item: Dict[str, str]) -> str:
                 return val
     return ""
 
-async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
+async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], counters: Dict) -> Dict[str, str]:
     url, source_col, is_social = pick_website_url(item)
     
-    # 1. Incoming CSV Emails
-    email_candidates: List[Tuple[str, str, int]] = [] # (email, source_url, base_score)
+    # 1. Check Incoming CSV Emails & Phones
+    email_candidates: List[Tuple[str, str, int]] = []
     existing_phones = []
     for k, val in item.items():
         lk = k.lower()
@@ -392,13 +390,24 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
                 site_host = clean_dom + ".com"
                 url = "https://" + site_host
 
-    if not site_host and not email_candidates:
-        return None
+    if not url:
+        counters["no_url"] += 1
+        return {
+            **item,
+            "email_found": "",
+            "email_source": "",
+            "email_status": "NO_WEBSITE",
+            "website_issue": "NO_WEBSITE_PROVIDED",
+            "all_emails_seen": "",
+            "phone_found": existing_phones[0] if existing_phones else "",
+            "all_phones_seen": "; ".join(existing_phones),
+            "title": "", "description": "", "site_name": "", "keywords": "", "language": "",
+            "address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found",
+            "facebook_url": "", "instagram_url": "", "linkedin_url": "", "twitter_url": "",
+            "text_content": "", "source_column_used": "", "final_url": ""
+        }
 
-    html_content = None
-    final_url = url or ""
-    if url and not is_social:
-        html_content, final_url = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
+    html_content, final_url, status_diag = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
 
     decoded = ""
     title = ""
@@ -413,6 +422,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     linkedin_url = ""
     twitter_url = ""
     full_clean_text = ""
+    website_issue = "LIVE"
 
     if html_content and len(html_content.strip()) >= 10:
         decoded = html.unescape(html_content)
@@ -420,12 +430,12 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         for se in scraped_emails:
             email_candidates.append((se, f"Scraped Homepage: {final_url}", 1200))
 
-        # Deep Subpage Crawling
-        if not email_candidates or len(scraped_emails) == 0:
+        # Deep Subpage Crawling (contact / about / team)
+        if not email_candidates:
             contact_urls = discover_contact_urls(final_url, decoded)
             contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
             contact_results = await asyncio.gather(*contact_tasks)
-            for contact_html, sub_url in contact_results:
+            for contact_html, sub_url, _ in contact_results:
                 if contact_html:
                     sub_emails = extract_emails_from_html(html.unescape(contact_html))
                     for sube in sub_emails:
@@ -468,6 +478,20 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         full_clean_text = clean_text(clean_p)
         location = extract_location(decoded, full_clean_text)
 
+        if not email_candidates:
+            website_issue = "CONTACT_FORM_ONLY"
+            counters["contact_form"] += 1
+    else:
+        if status_diag == "BLOCKED_CLOUDFLARE_403":
+            website_issue = "BLOCKED_CLOUDFLARE_CAPTCHA"
+            counters["blocked"] += 1
+        elif status_diag == "DEAD_EXPIRED_DOMAIN":
+            website_issue = "DEAD_EXPIRED_DOMAIN"
+            counters["dead_domain"] += 1
+        else:
+            website_issue = f"FAILED_{status_diag}"
+            counters["dead_domain"] += 1
+
     # 4. Social Page Scraping Fallback
     if not email_candidates and (facebook_url or instagram_url):
         target_social = facebook_url or instagram_url
@@ -482,30 +506,39 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         if search_res:
             email_candidates.extend(search_res)
 
-    if not email_candidates:
-        return None
+    best_email = ""
+    best_source = ""
+    email_status = "NOT_FOUND"
+    all_seen = ""
 
-    # Deduplicate and sort by score
-    unique_candidates: Dict[str, Tuple[str, str, int]] = {}
-    for cand in email_candidates:
-        em = cand[0].lower().strip()
-        if em not in unique_candidates:
-            unique_candidates[em] = cand
+    if email_candidates:
+        unique_candidates: Dict[str, Tuple[str, str, int]] = {}
+        for cand in email_candidates:
+            em = cand[0].lower().strip()
+            if em not in unique_candidates:
+                unique_candidates[em] = cand
 
-    scored = sorted(unique_candidates.values(), key=lambda c: score_email_candidate(c, site_host), reverse=True)
-    best_cand = scored[0]
-    best_email = best_cand[0]
-    best_source = best_cand[1]
+        scored = sorted(unique_candidates.values(), key=lambda c: score_email_candidate(c, site_host), reverse=True)
+        best_cand = scored[0]
+        best_email = best_cand[0]
+        best_source = best_cand[1]
+        email_status = "VERIFIED_SCRAPED" if "Scraped" in best_source else ("INPUT_CSV" if "CSV" in best_source else "SEARCH_CACHE")
+        all_seen = "; ".join([c[0] for c in scored])
+        website_issue = "LIVE_WITH_EMAIL"
 
-    email_status = "VERIFIED_SCRAPED" if "Scraped" in best_source else ("INPUT_CSV" if "CSV" in best_source else "PATTERN_ACTIVE_DOMAIN")
     best_phone = phones[0] if phones else ""
+    if best_phone:
+        counters["phones"] += 1
+    if location["address_found"]:
+        counters["addresses"] += 1
 
     result = dict(item)
     result.update({
         "email_found": best_email,
         "email_source": best_source,
         "email_status": email_status,
-        "all_emails_seen": "; ".join([c[0] for c in scored]),
+        "website_issue": website_issue,
+        "all_emails_seen": all_seen,
         "phone_found": best_phone,
         "all_phones_seen": "; ".join(phones),
         "title": title,
@@ -600,7 +633,13 @@ class TelegramBot:
         async with self.session.get(download_url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
             return await resp.read()
 
-def render_progress(processed: int, total: int, found: int, start_time: float) -> str:
+def render_progress_diagnostics(job_data: Dict) -> str:
+    processed = job_data["processed_count"]
+    total = job_data["total_rows"]
+    found = job_data["found_count"]
+    start_time = job_data["start_time"]
+    c = job_data["counters"]
+
     pct = round((processed / total) * 100) if total > 0 else 0
     elapsed = max(time.time() - start_time, 0.001)
     rate = processed / elapsed
@@ -618,60 +657,48 @@ def render_progress(processed: int, total: int, found: int, start_time: float) -
 
     stage_emoji = "🏁" if pct >= 100 else ("🔥" if pct >= 75 else ("⚡" if pct >= 50 else ("🔎" if pct >= 25 else "🚀")))
     success_rate = round((found / max(processed, 1)) * 100)
-    success_emoji = "🟢" if success_rate >= 40 else ("🟡" if success_rate >= 15 else "🔴")
+    success_emoji = "🟢" if success_rate >= 40 else ("🟡" if success_rate >= 10 else "🔴")
 
     return (
         f"{stage_emoji} *LEAD ENRICHMENT — LIVE STATUS*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{bar}\n"
         f"*{pct}%* Complete\n\n"
-        f"📦 *Processed:* `{processed:,}` / `{total:,}`\n"
-        f"📧 *Emails Found:* `{found:,}`\n"
-        f"{success_emoji} *Success Rate:* `{success_rate}%`\n"
+        f"📦 *Total Processed:* `{processed:,}` / `{total:,}` rows\n"
         f"⚡ *Realtime Speed:* `{rate:.1f} rows/sec`\n"
         f"⏱ *ETA:* `{eta_text}`\n\n"
+        f"📊 *LIVE DISCOVERY STATS:*\n"
+        f"📧 *Verified Emails:* `{found:,}` ({success_emoji} `{success_rate}%`)\n"
+        f"📞 *Phone Numbers:* `{c['phones']:,}`\n"
+        f"📍 *Physical Addresses:* `{c['addresses']:,}`\n\n"
+        f"⚠️ *WEBSITE ISSUES BREAKDOWN:*\n"
+        f"📝 *Contact Form Only:* `{c['contact_form']:,}`\n"
+        f"💀 *Dead / Expired Sites:* `{c['dead_domain']:,}`\n"
+        f"🛡️ *Cloudflare / Blocked:* `{c['blocked']:,}`\n"
+        f"🚫 *No Website in Row:* `{c['no_url']:,}`\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 _Click button below to stop anytime & download_"
     )
 
 def build_result_csv(enriched_results: List[Dict[str, str]]) -> bytes:
-    seen_emails: Set[str] = set()
-    seen_hosts: Set[str] = set()
-    final_leads: List[Dict[str, str]] = []
-
-    for item in enriched_results:
-        email = (item.get("email_found") or "").strip().lower()
-        host = item.get("__matched_host") or ""
-        if email and email in seen_emails:
-            continue
-        if host and host in seen_hosts:
-            continue
-        if email:
-            seen_emails.add(email)
-        if host:
-            seen_hosts.add(host)
-
-        clean_item = dict(item)
-        clean_item.pop("__matched_host", None)
-        final_leads.append(clean_item)
-
-    if not final_leads:
+    if not enriched_results:
         return b""
 
     PREFERRED_ORDER = [
-        'email_found', 'email_source', 'email_status', 'all_emails_seen', 'phone_found', 'all_phones_seen',
+        'email_found', 'email_source', 'email_status', 'website_issue',
+        'all_emails_seen', 'phone_found', 'all_phones_seen',
         'title', 'description', 'site_name', 'keywords', 'language',
         'address_found', 'city', 'state', 'zip', 'location_source',
         'facebook_url', 'instagram_url', 'linkedin_url', 'twitter_url',
         'text_content', 'source_column_used', 'final_url'
     ]
-    all_keys = list(final_leads[0].keys())
-    ordered_headers = [k for k in PREFERRED_ORDER if k in all_keys] + [k for k in all_keys if k not in PREFERRED_ORDER]
+    all_keys = list(enriched_results[0].keys())
+    ordered_headers = [k for k in PREFERRED_ORDER if k in all_keys] + [k for k in all_keys if k not in PREFERRED_ORDER if k != '__matched_host']
 
     out_stream = io.StringIO()
     writer = csv.DictWriter(out_stream, fieldnames=ordered_headers, extrasaction='ignore')
     writer.writeheader()
-    writer.writerows(final_leads)
+    writer.writerows(enriched_results)
     return out_stream.getvalue().encode("utf-8")
 
 async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, file_name: str):
@@ -681,7 +708,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         ]
     }
 
-    status_msg_id = await bot.send_message(chat_id, "🔎 *Got your file — launching turbo enrichment engine...*\n\n░░░░░░░░░░░░░░░░░░░░ 0%", reply_markup=stop_button_markup)
+    status_msg_id = await bot.send_message(chat_id, "🔎 *Got your file — launching diagnostic enrichment engine...*\n\n░░░░░░░░░░░░░░░░░░░░ 0%", reply_markup=stop_button_markup)
     if not status_msg_id:
         return
 
@@ -719,6 +746,14 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
             "found_count": 0,
             "start_time": time.time(),
             "total_rows": total_rows,
+            "counters": {
+                "phones": 0,
+                "addresses": 0,
+                "contact_form": 0,
+                "dead_domain": 0,
+                "blocked": 0,
+                "no_url": 0
+            },
             "enriched_results": [],
             "status_msg_id": status_msg_id,
             "queue": queue,
@@ -732,7 +767,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
             last_text = ""
             while not stop_updater and not job_data["is_stopped"]:
                 await asyncio.sleep(1.8)
-                text = render_progress(job_data["processed_count"], total_rows, job_data["found_count"], job_data["start_time"])
+                text = render_progress_diagnostics(job_data)
                 if text != last_text:
                     await bot.edit_message(chat_id, status_msg_id, text, reply_markup=stop_button_markup)
                     last_text = text
@@ -749,9 +784,10 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
                     except (asyncio.QueueEmpty, Exception):
                         break
                     try:
-                        res = await process_lead(scraper_session, item)
+                        res = await process_lead(scraper_session, item, job_data["counters"])
                         if res:
-                            job_data["found_count"] += 1
+                            if res.get("email_found"):
+                                job_data["found_count"] += 1
                             job_data["enriched_results"].append(res)
                     except asyncio.CancelledError:
                         break
@@ -773,22 +809,29 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
 
         final_csv_bytes = build_result_csv(job_data["enriched_results"])
         if not final_csv_bytes:
-            await bot.edit_message(chat_id, status_msg_id, "⚠️ Enrichment finished, but no valid contact emails were found.")
+            await bot.edit_message(chat_id, status_msg_id, "⚠️ Enrichment finished, but no leads could be processed.")
             return
 
         elapsed = max(time.time() - job_data["start_time"], 0.001)
         elapsed_text = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed > 60 else f"{int(elapsed)}s"
         final_count = len(job_data["enriched_results"])
         avg_speed = f"{(job_data['processed_count'] / elapsed):.1f}"
+        c = job_data["counters"]
 
         status_title = "🛑 *ENRICHMENT STOPPED (EARLY OUTPUT)*" if was_stopped else "✅ *ENRICHMENT COMPLETE!*"
         summary_text = (
             f"{status_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📄 *Leads Generated:* `{final_count:,}` (deduped)\n"
-            f"🔎 *Scanned:* `{job_data['processed_count']:,}` / `{total_rows:,}` rows\n"
-            f"⚡ *Avg Speed:* `{avg_speed} rows/sec`\n"
-            f"⏱ *Total Time:* `{elapsed_text}`\n\n"
+            f"📄 *Total Leads Processed:* `{final_count:,}` rows\n"
+            f"📧 *Verified Real Emails:* `{job_data['found_count']:,}`\n"
+            f"📞 *Phone Numbers:* `{c['phones']:,}`\n"
+            f"📍 *Physical Addresses:* `{c['addresses']:,}`\n\n"
+            f"🔍 *WEBSITE DIAGNOSTICS:*\n"
+            f"• 📝 Contact Form Only: `{c['contact_form']:,}`\n"
+            f"• 💀 Dead / Expired Sites: `{c['dead_domain']:,}`\n"
+            f"• 🛡️ Blocked / Cloudflare: `{c['blocked']:,}`\n"
+            f"• 🚫 No Website Given: `{c['no_url']:,}`\n\n"
+            f"⚡ *Avg Speed:* `{avg_speed} rows/sec` | ⏱ *Total Time:* `{elapsed_text}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📎 *Enriched file attached below* 👇"
         )
@@ -840,7 +883,7 @@ WELCOME_MESSAGE = (
     "🌐 *Title, Description & Socials*\n\n"
     "⚡ *Features:*\n"
     "• Up to 50,000 leads supported\n"
-    "• Ultra Turbo speed with live rows/sec\n"
+    "• Ultra Turbo speed with live diagnostics\n"
     "• 🛑 Stop & Download button anytime\n\n"
     "👉 *Simply attach & send your `.csv` file now!*"
 )
@@ -896,7 +939,7 @@ async def main():
 
     bot = TelegramBot(TELEGRAM_BOT_TOKEN)
     await bot.init()
-    print("Turbo Lead Enricher Bot is running 24/7 with Live Speed & Stop Button...")
+    print("Turbo Lead Enricher Bot is running 24/7 with Live Diagnostics...")
     print("Waiting for CSV files on Telegram (@alif_support_alert_bot)...")
 
     offset = 0
