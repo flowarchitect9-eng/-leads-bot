@@ -24,11 +24,11 @@ if sys.platform == "win32":
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
 
-CONCURRENCY_LIMIT = 500
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=2.5, connect=1.2, sock_read=1.5)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=2.0, connect=1.0, sock_read=1.2)
-MAX_HTML_SIZE = 512 * 1024  # 512KB max per page for maximum parsing speed
-CONTACT_PAGES = ["/contact", "/about", "/contact-us"]
+CONCURRENCY_LIMIT = 400
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=8.0, connect=4.0, sock_read=5.0)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=6.0, connect=3.5, sock_read=4.0)
+MAX_HTML_SIZE = 3 * 1024 * 1024  # 3MB max as in n8n
+CONTACT_PAGES = ["/contact", "/contact-us", "/about", "/about-us"]
 
 SOCIAL_HOSTS = {
     'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com',
@@ -53,7 +53,7 @@ RE_US_ADDRESS = re.compile(rf"([A-Za-z .\'-]{{2,40}}),?\s*({US_STATE_ABBR})\s*(\
 RE_STREET = re.compile(r"\d{1,6}\s+[A-Za-z0-9.\s]{3,50}?(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Suite|Ste)\.?\s*[\w#-]*$", re.I)
 RE_EMAIL = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 RE_PHONE = re.compile(r"(?<![\d./])(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]\d{3,4}[-.\s]?\d{3,4}(?![\d./])")
-RE_TEL_LINK = re.compile(r'href=[\'"]tel:([+\d][\d\s\-().]{5,18})[\'"]', re.I)
+RE_TEL_LINK = re.compile(r'tel:([+\d][\d\s\-().]{5,18})', re.I)
 RE_MAILTO = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', re.I)
 RE_CF_EMAIL = re.compile(r'data-cfemail=[\'"]([a-f0-9]+)[\'"]', re.I)
 
@@ -298,32 +298,41 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9'
 }
 
-async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Optional[str]:
-    try:
-        async with session.get(url, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
-            if resp.status < 400:
-                ct = resp.headers.get("Content-Type", "").lower()
-                if "text/html" in ct or "application/xhtml" in ct or not ct:
-                    content = await resp.read()
-                    if len(content) > MAX_HTML_SIZE:
-                        content = content[:MAX_HTML_SIZE]
-                    return content.decode("utf-8", errors="ignore")
-    except Exception:
-        pass
-    return None
+async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str]:
+    attempts = [url]
+    if url.startswith("https://"):
+        attempts.append(url.replace("https://", "http://"))
+
+    for u in attempts:
+        try:
+            async with session.get(u, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
+                if resp.status < 400:
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    if "text/html" in ct or "application/xhtml" in ct or not ct:
+                        content = await resp.read()
+                        if len(content) > MAX_HTML_SIZE:
+                            content = content[:MAX_HTML_SIZE]
+                        return content.decode("utf-8", errors="ignore"), str(resp.url)
+        except Exception:
+            continue
+    return None, url
 
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> Optional[Dict[str, str]]:
     url, source_col, is_social = pick_website_url(item)
     if not url or is_social:
         return None
 
-    # 1. Fetch homepage (fast)
-    html_content = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
-    if not html_content:
-        # If dead/failed, skip immediately to prevent massive delays!
-        return None
+    existing_emails = []
+    existing_phones = []
+    for k, val in item.items():
+        lk = k.lower()
+        if 'email' in lk and isinstance(val, str) and '@' in val:
+            existing_emails.append(val.strip().lower())
+        if 'phone' in lk and isinstance(val, str) and val.strip():
+            existing_phones.append(val.strip())
 
-    if len(html_content.strip()) < 20:
+    html_content, final_url = await fetch_page(session, url, HOMEPAGE_TIMEOUT)
+    if not html_content or len(html_content.strip()) < 10:
         return None
 
     if ("__cf_chl" in html_content or "cf-browser-verification" in html_content or "Just a moment..." in html_content) and len(html_content) < 12000:
@@ -331,12 +340,13 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
     decoded = html.unescape(html_content)
     emails = extract_emails(decoded)
+    emails = list(dict.fromkeys(emails + existing_emails))
 
-    # 2. Only check subpages if homepage succeeded but has no emails
+    # Check contact/about subpages if homepage has no email
     if not emails:
-        contact_tasks = [fetch_page(session, urllib.parse.urljoin(url, p), SUBPAGE_TIMEOUT) for p in CONTACT_PAGES]
+        contact_tasks = [fetch_page(session, urllib.parse.urljoin(final_url, p), SUBPAGE_TIMEOUT) for p in CONTACT_PAGES]
         contact_results = await asyncio.gather(*contact_tasks)
-        for contact_html in contact_results:
+        for contact_html, _ in contact_results:
             if contact_html:
                 sub_emails = extract_emails(html.unescape(contact_html))
                 if sub_emails:
@@ -346,11 +356,10 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     if not emails:
         return None
 
-    # 3. Metadata, Phone & Location
-    site_host = get_hostname(url)
+    emails = list(dict.fromkeys(emails))
+    site_host = get_hostname(final_url)
     best_email = sorted(emails, key=lambda e: score_email(e, site_host), reverse=True)[0]
-    
-    existing_phones = [item[k].strip() for k in item if 'phone' in k.lower() and item[k].strip()]
+
     phones = extract_phones(decoded, existing_phones)
     best_phone = phones[0] if phones else ""
 
@@ -360,6 +369,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
     clean_p = re.sub(r"<script[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
     clean_p = re.sub(r"<style[^>]*>.*?</style>", " ", clean_p, flags=re.I | re.S)
+    clean_p = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", clean_p, flags=re.I | re.S)
     clean_p = re.sub(r"<[^>]+>", " ", clean_p)
     full_clean_text = clean_text(clean_p)
     location = extract_location(decoded, full_clean_text)
@@ -382,7 +392,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         "location_source": location["location_source"],
         "text_content": full_clean_text[:500],
         "source_column_used": source_col,
-        "final_url": url,
+        "final_url": final_url,
         "__matched_host": site_host
     })
     return result
