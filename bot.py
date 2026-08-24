@@ -440,6 +440,17 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     full_clean_text = clean_text(clean_p)
     location = extract_location(decoded, full_clean_text)
 
+    # Extract Social Media Profiles
+    fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
+    ig_m = re.search(r'href=[\'"](https?://(?:www\.)?instagram\.com/[^\'"]+)[\'"]', decoded, re.I)
+    li_m = re.search(r'href=[\'"](https?://(?:www\.)?linkedin\.com/(?:company|in)/[^\'"]+)[\'"]', decoded, re.I)
+    tw_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\'"]+)[\'"]', decoded, re.I)
+
+    facebook_url = fb_m.group(1).split('?')[0] if fb_m else ""
+    instagram_url = ig_m.group(1).split('?')[0] if ig_m else ""
+    linkedin_url = li_m.group(1).split('?')[0] if li_m else ""
+    twitter_url = tw_m.group(1).split('?')[0] if tw_m else ""
+
     result = dict(item)
     result.update({
         "email_found": best_email,
@@ -456,6 +467,10 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         "state": location["state"],
         "zip": location["zip"],
         "location_source": location["location_source"],
+        "facebook_url": facebook_url,
+        "instagram_url": instagram_url,
+        "linkedin_url": linkedin_url,
+        "twitter_url": twitter_url,
         "text_content": full_clean_text[:500],
         "source_column_used": source_col,
         "final_url": final_url,
@@ -603,8 +618,9 @@ def build_result_csv(enriched_results: List[Dict[str, str]]) -> bytes:
     PREFERRED_ORDER = [
         'email_found', 'all_emails_seen', 'phone_found', 'all_phones_seen',
         'title', 'description', 'site_name', 'keywords', 'language',
-        'address_found', 'city', 'state', 'zip', 'location_source', 'text_content',
-        'source_column_used', 'final_url'
+        'address_found', 'city', 'state', 'zip', 'location_source',
+        'facebook_url', 'instagram_url', 'linkedin_url', 'twitter_url',
+        'text_content', 'source_column_used', 'final_url'
     ]
     all_keys = list(final_leads[0].keys())
     ordered_headers = [k for k in PREFERRED_ORDER if k in all_keys] + [k for k in all_keys if k not in PREFERRED_ORDER]
@@ -808,6 +824,18 @@ def start_health_thread():
     t = threading.Thread(target=run_sync_http_server, args=(port,), daemon=True)
     t.start()
 
+async def keep_alive_pinger():
+    port = int(os.environ.get("PORT", 10000))
+    await asyncio.sleep(15)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"http://127.0.0.1:{port}/", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(240)
+
 async def main():
     global IS_PUBLIC_ACTIVE
     loop = asyncio.get_running_loop()
@@ -819,9 +847,11 @@ async def main():
     except Exception as e:
         print(f"Web server notice: {e}")
 
+    asyncio.create_task(keep_alive_pinger())
+
     bot = TelegramBot(TELEGRAM_BOT_TOKEN)
     await bot.init()
-    print("Turbo Lead Enricher Bot is running with Live Speed & Stop Button...")
+    print("Turbo Lead Enricher Bot is running 24/7 with Live Speed & Stop Button...")
     print("Waiting for CSV files on Telegram (@alif_support_alert_bot)...")
 
     offset = 0
