@@ -678,19 +678,29 @@ WELCOME_MESSAGE = (
     "👉 *Simply attach & send your `.csv` file now!*"
 )
 
-async def handle_health(request):
-    return aiohttp.web.Response(text="Bot is running!")
+def run_sync_http_server(port):
+    import http.server
+    import socketserver
+    class HealthHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Lead Enricher Bot is Live and Healthy!")
+        def log_message(self, format, *args):
+            pass
+    try:
+        with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
+            print(f"[RENDER HEALTH] Web server successfully bound to 0.0.0.0:{port}", flush=True)
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"[RENDER HEALTH] Server on port {port} error: {e}", flush=True)
 
-async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app = aiohttp.web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/health", handle_health)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Health check server running on port {port}")
+def start_health_thread():
+    import threading
+    port = int(os.environ.get("PORT", 10000))
+    t = threading.Thread(target=run_sync_http_server, args=(port,), daemon=True)
+    t.start()
 
 async def main():
     loop = asyncio.get_running_loop()
@@ -699,7 +709,7 @@ async def main():
 
     # Start healthcheck server for Render
     try:
-        await start_web_server()
+        start_health_thread()
     except Exception as e:
         print(f"Web server notice: {e}")
 
