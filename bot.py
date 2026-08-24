@@ -476,18 +476,18 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
     if html_content and len(html_content.strip()) >= 10:
         decoded = html.unescape(html_content)
-        scraped_emails = extract_emails_from_html(decoded)
+        scraped_emails = extract_emails(decoded)
         if scraped_emails:
             emails.extend(scraped_emails)
 
         # Deep subpage scraping for contact / about / team
         if not emails:
-            contact_urls = discover_subpage_urls(final_url, decoded)
+            contact_urls = discover_contact_urls(final_url, decoded)
             contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
             contact_results = await asyncio.gather(*contact_tasks)
             for contact_html, _ in contact_results:
                 if contact_html:
-                    sub_emails = extract_emails_from_html(html.unescape(contact_html))
+                    sub_emails = extract_emails(html.unescape(contact_html))
                     if sub_emails:
                         emails.extend(sub_emails)
 
@@ -506,11 +506,11 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
 
         m_og = re.search(r'property=[\'"]og:title[\'"][^>]*content=[\'"]([^\'"]{2,200})[\'"]', decoded, re.I)
         m_t = re.search(r'<title[^>]*>([^<]{2,200})</title>', decoded, re.I)
-        title = clean_text(decode_entities(m_og.group(1) if m_og else (m_t.group(1) if m_t else "")))[:150]
+        title = clean_text(html.unescape(m_og.group(1) if m_og else (m_t.group(1) if m_t else "")))[:150]
 
         og_desc = re.search(r'property=[\'"]og:description[\'"][^>]*content=[\'"]([^\'"]{10,})[\'"]', decoded, re.I)
         m_desc = re.search(r'<meta[^>]+name=[\'"]description[\'"][^>]+content=[\'"]([^\'"]{10,})[\'"]', decoded, re.I)
-        description = clean_text(decode_entities(og_desc.group(1) if og_desc else (m_desc.group(1) if m_desc else "")))[:300]
+        description = clean_text(html.unescape(og_desc.group(1) if og_desc else (m_desc.group(1) if m_desc else "")))[:300]
 
         clean_p = re.sub(r"<script[^>]*>.*?</script>", " ", decoded, flags=re.I | re.S)
         clean_p = re.sub(r"<style[^>]*>.*?</style>", " ", clean_p, flags=re.I | re.S)
@@ -532,17 +532,6 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
     best_email = sorted(emails, key=lambda e: score_email(e, site_host), reverse=True)[0]
     best_phone = phones[0] if phones else ""
 
-    # Extract Social Media Profiles
-    fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
-    ig_m = re.search(r'href=[\'"](https?://(?:www\.)?instagram\.com/[^\'"]+)[\'"]', decoded, re.I)
-    li_m = re.search(r'href=[\'"](https?://(?:www\.)?linkedin\.com/(?:company|in)/[^\'"]+)[\'"]', decoded, re.I)
-    tw_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\'"]+)[\'"]', decoded, re.I)
-
-    facebook_url = fb_m.group(1).split('?')[0] if fb_m else ""
-    instagram_url = ig_m.group(1).split('?')[0] if ig_m else ""
-    linkedin_url = li_m.group(1).split('?')[0] if li_m else ""
-    twitter_url = tw_m.group(1).split('?')[0] if tw_m else ""
-
     result = dict(item)
     result.update({
         "email_found": best_email,
@@ -551,9 +540,9 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str]) -> 
         "all_phones_seen": "; ".join(phones),
         "title": title,
         "description": description,
-        "site_name": meta["site_name"],
-        "keywords": meta["keywords"],
-        "language": meta["language"],
+        "site_name": site_name,
+        "keywords": keywords,
+        "language": language,
         "address_found": location["address_found"],
         "city": location["city"],
         "state": location["state"],
