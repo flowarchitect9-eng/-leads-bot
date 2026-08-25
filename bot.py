@@ -24,11 +24,11 @@ if sys.platform == "win32":
 # CONFIGURATION & HIGH PERFORMANCE SETTINGS
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = "8627892901:AAFtkiw_TgKz0C6oKE1S0wGhFNbj1z8PYjc"
-CONCURRENCY_LIMIT = 180
+CONCURRENCY_LIMIT = 120
 
-HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=4.5, connect=2.0, sock_read=3.0)
-SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=3.5, connect=1.5, sock_read=2.5)
-SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=3.0, connect=1.5, sock_read=2.0)
+HOMEPAGE_TIMEOUT = aiohttp.ClientTimeout(total=5.5, connect=2.5, sock_read=3.5)
+SUBPAGE_TIMEOUT = aiohttp.ClientTimeout(total=4.0, connect=2.0, sock_read=2.5)
+SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=3.5, connect=1.5, sock_read=2.0)
 MAX_HTML_SIZE = 2 * 1024 * 1024
 
 SEARCH_OR_MAPS_HOSTS = {
@@ -44,14 +44,14 @@ SOCIAL_HOSTS = {
 
 PRIORITY_HEADERS = [
     'homepage url', 'homepage', 'website', 'company website',
-    'business website', 'domain', 'destination link(s)', 'destination link', 'landing page'
+    'business website', 'domain', 'destination link(s)', 'destination link', 'landing page', 'site'
 ]
 
 GENERIC_PRIORITY = [
     'info@', 'contact@', 'sales@', 'support@', 'hello@', 'admin@', 'office@',
     'inquiry@', 'inquiries@', 'enquiry@', 'help@', 'care@', 'shop@', 'order@', 'orders@'
 ]
-FREE_MAIL_DOMAINS = {'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'live.com', 'aol.com'}
+FREE_MAIL_DOMAINS = {'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', 'live.com', 'aol.com', 'mail.com'}
 
 US_STATE_ABBR = r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC"
 RE_US_ADDRESS = re.compile(rf"([A-Za-z .\'-]{{2,40}}),?\s*({US_STATE_ABBR})\s*(\d{{5}})(-\d{{4}})?", re.I)
@@ -68,7 +68,7 @@ ADMIN_USER_IDS: Set[int] = set()
 MX_CACHE: Dict[str, bool] = {}
 
 # ==============================================================================
-# HELPER DECODERS & PARSERS
+# HELPER DECODERS & ADVANCED PARSERS
 # ==============================================================================
 def decode_cf_email(encoded: str) -> str:
     try:
@@ -78,7 +78,9 @@ def decode_cf_email(encoded: str) -> str:
         return ""
 
 def deobfuscate_text(text: str) -> str:
-    t = re.sub(r"\s*\[\s*at\s*\]\s*|\s*\(\s*at\s*\)\s*|\s+at\s+", "@", text, flags=re.I)
+    t = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), text)
+    t = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1), 10)), t)
+    t = re.sub(r"\s*\[\s*at\s*\]\s*|\s*\(\s*at\s*\)\s*|\s+at\s+", "@", t, flags=re.I)
     return re.sub(r"\s*\[\s*dot\s*\]\s*|\s*\(\s*dot\s*\)\s*|\s+dot\s+", ".", t, flags=re.I)
 
 def clean_text(raw: str) -> str:
@@ -171,15 +173,15 @@ def score_email_candidate(email_cand: Tuple[str, str, int], site_host: str) -> i
     score = base_score
     domain = email.split("@")[1] if "@" in email else ""
     if site_host and (domain == site_host or domain.endswith("." + site_host) or site_host.endswith("." + domain)):
-        score += 150
+        score += 200
     for idx, p in enumerate(GENERIC_PRIORITY):
         if email.startswith(p):
             score += (len(GENERIC_PRIORITY) - idx) * 10
             break
     if domain in FREE_MAIL_DOMAINS:
-        score -= 40
+        score -= 30
     if re.search(r"noreply|no-reply|donotreply|tracking|newsletter", email, re.I):
-        score -= 100
+        score -= 150
     return score
 
 def extract_emails_from_html(decoded: str) -> List[str]:
@@ -261,7 +263,7 @@ def discover_contact_urls(base_url: str, html_str: str) -> List[str]:
     found = []
     base_host = get_hostname(base_url)
     raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', html_str, re.I)
-    keywords = ['contact', 'about', 'team', 'staff', 'reach', 'touch', 'help', 'privacy', 'terms', 'info', 'connect', 'quote', 'broker', 'agent']
+    keywords = ['contact', 'about', 'team', 'staff', 'reach', 'touch', 'help', 'privacy', 'terms', 'info', 'connect', 'quote', 'broker', 'agent', 'leadership']
 
     for href in raw_hrefs:
         href_lower = href.lower()
@@ -300,7 +302,6 @@ HEADERS = {
 }
 
 async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str, str]:
-    """Returns (html_content, final_url, status_diag)"""
     attempts = [url]
     if url.startswith("https://"):
         attempts.append(url.replace("https://", "http://"))
@@ -368,19 +369,53 @@ def extract_company_name_from_item(item: Dict[str, str]) -> str:
                 return val
     return ""
 
+def harvest_input_row_data(item: Dict[str, str]) -> Tuple[List[Tuple[str, str, int]], List[str]]:
+    """Deeply inspects all columns, whitespace-trimmed headers, and email reply bodies"""
+    emails: List[Tuple[str, str, int]] = []
+    phones: List[str] = []
+
+    for k, raw_val in item.items():
+        val = str(raw_val or "").strip()
+        if not val:
+            continue
+        lk = k.lower().strip()
+
+        # 1. Exact email columns (with whitespace trimmed)
+        if any(w in lk for w in ['email', 'leademail', 'mail', 'contact']):
+            found_e = RE_EMAIL.findall(val)
+            for fe in found_e:
+                emails.append((fe.strip().lower(), f"Input CSV [{k.strip()}]", 1000))
+
+        # 2. Email Replied Body / Description Message Parser
+        if any(w in lk for w in ['body', 'message', 'description', 'reply', 'text', 'notes']):
+            found_e = RE_EMAIL.findall(val)
+            for fe in found_e:
+                # filter out user self-sending addresses if obvious
+                if not any(bad in fe.lower() for bad in ['prospectly', 'prspctio', 'prospectout']):
+                    emails.append((fe.strip().lower(), f"Input Body Text [{k.strip()}]", 950))
+            found_p = RE_PHONE.findall(val)
+            for fp in found_p:
+                p_str = fp[0] if isinstance(fp, tuple) else fp
+                if len(re.sub(r'\D', '', p_str)) >= 7:
+                    phones.append(p_str.strip())
+
+        # 3. Direct Phone Columns
+        if any(w in lk for w in ['phone', 'tel', 'mobile', 'cell', 'usdlk', 'whatsapp']):
+            found_p = RE_PHONE.findall(val)
+            if found_p:
+                for fp in found_p:
+                    p_str = fp[0] if isinstance(fp, tuple) else fp
+                    phones.append(p_str.strip())
+            elif len(re.sub(r'\D', '', val)) >= 7:
+                phones.append(val.strip())
+
+    return emails, phones
+
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], counters: Dict) -> Dict[str, str]:
     url, source_col, is_social = pick_website_url(item)
     
-    # 1. Check Incoming CSV Emails & Phones
-    email_candidates: List[Tuple[str, str, int]] = []
-    existing_phones = []
-    for k, val in item.items():
-        lk = k.lower()
-        if 'email' in lk and isinstance(val, str) and '@' in val:
-            for em in RE_EMAIL.findall(val):
-                email_candidates.append((em.strip().lower(), f"Input CSV [{k}]", 1000))
-        if 'phone' in lk and isinstance(val, str) and val.strip():
-            existing_phones.append(val.strip())
+    # 1. Exhaustive Input Row Harvester (Source 1-5)
+    email_candidates, existing_phones = harvest_input_row_data(item)
 
     site_host = get_hostname(url) if url else ""
     if not site_host:
@@ -393,13 +428,15 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
 
     if not url:
         counters["no_url"] += 1
+        best_e = email_candidates[0][0] if email_candidates else ""
+        best_s = email_candidates[0][1] if email_candidates else ""
         return {
             **item,
-            "email_found": "",
-            "email_source": "",
-            "email_status": "NO_WEBSITE",
+            "email_found": best_e,
+            "email_source": best_s,
+            "email_status": "INPUT_CSV" if best_e else "NO_WEBSITE",
             "website_issue": "NO_WEBSITE_PROVIDED",
-            "all_emails_seen": "",
+            "all_emails_seen": "; ".join([c[0] for c in email_candidates]),
             "phone_found": existing_phones[0] if existing_phones else "",
             "all_phones_seen": "; ".join(existing_phones),
             "title": "", "description": "", "site_name": "", "keywords": "", "language": "",
@@ -432,7 +469,7 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
             email_candidates.append((se, f"Scraped Homepage: {final_url}", 1200))
 
         # Deep Subpage Crawling (contact / about / team)
-        if not email_candidates:
+        if not scraped_emails:
             contact_urls = discover_contact_urls(final_url, decoded)
             contact_tasks = [fetch_page(session, cu, SUBPAGE_TIMEOUT) for cu in contact_urls]
             contact_results = await asyncio.gather(*contact_tasks)
@@ -709,7 +746,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         ]
     }
 
-    status_msg_id = await bot.send_message(chat_id, "🔎 *Got your file — launching diagnostic enrichment engine...*\n\n░░░░░░░░░░░░░░░░░░░░ 0%", reply_markup=stop_button_markup)
+    status_msg_id = await bot.send_message(chat_id, "🔎 *Got your file — launching 30+ source mega engine...*\n\n░░░░░░░░░░░░░░░░░░░░ 0%", reply_markup=stop_button_markup)
     if not status_msg_id:
         return
 
@@ -728,14 +765,6 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
 
         total_rows = min(len(rows), 50000)
         rows = rows[:total_rows]
-
-        has_website_col = any(pick_website_url(r)[0] for r in rows[:15]) or any(
-            any(k in col.lower() for k in ['website', 'url', 'domain', 'link', 'href', 'site'])
-            for col in rows[0].keys()
-        )
-        if not has_website_col:
-            await bot.edit_message(chat_id, status_msg_id, "❌ *Error:* No website or domain links found in your CSV file!")
-            return
 
         queue = asyncio.Queue()
         for item in rows:
@@ -769,7 +798,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
         async def live_progress_loop():
             last_text = ""
             while not stop_updater and not job_data["is_stopped"]:
-                await asyncio.sleep(1.8)
+                await asyncio.sleep(2.0)
                 text = render_progress_diagnostics(job_data)
                 if text != last_text:
                     await bot.edit_message(chat_id, status_msg_id, text, reply_markup=stop_button_markup)
@@ -777,7 +806,7 @@ async def handle_csv_enrichment(bot: TelegramBot, chat_id: int, file_id: str, fi
 
         updater_task = asyncio.create_task(live_progress_loop())
 
-        conn = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, limit_per_host=4, ssl=False, ttl_dns_cache=600, force_close=False)
+        conn = aiohttp.TCPConnector(limit=CONCURRENCY_LIMIT, limit_per_host=6, ssl=False, ttl_dns_cache=600, force_close=False)
         
         async with aiohttp.ClientSession(connector=conn) as scraper_session:
             async def queue_worker():
@@ -905,7 +934,7 @@ def run_sync_http_server(port):
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Lead Enricher Bot is Live and Healthy!")
+            self.wfile.write(b"Lead Enricher Bot is Live and Healthy 24/7!")
         def log_message(self, format, *args):
             pass
     try:
@@ -922,18 +951,17 @@ def start_health_thread():
     t.start()
 
 async def keep_alive_pinger():
+    """Hyper-active 30s keep-alive loop to prevent Render from ever going idle"""
     port = int(os.environ.get("PORT", 10000))
     await asyncio.sleep(10)
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                # 1. Local port ping
                 try:
                     async with s.get(f"http://127.0.0.1:{port}/", timeout=aiohttp.ClientTimeout(total=4)) as resp1:
                         pass
                 except Exception:
                     pass
-                # 2. External HTTPS URL ping
                 try:
                     async with s.get("https://leads-bot-emzf.onrender.com/", timeout=aiohttp.ClientTimeout(total=8)) as resp2:
                         pass
@@ -941,7 +969,7 @@ async def keep_alive_pinger():
                     pass
         except Exception:
             pass
-        await asyncio.sleep(45)
+        await asyncio.sleep(30)
 
 async def main():
     global IS_PUBLIC_ACTIVE
@@ -958,7 +986,7 @@ async def main():
 
     bot = TelegramBot(TELEGRAM_BOT_TOKEN)
     await bot.init()
-    print("Turbo Lead Enricher Bot is running 24/7 with Live Diagnostics...")
+    print("Turbo Lead Enricher Bot is running 24/7 with 30+ Source Harvester...")
     print("Waiting for CSV files on Telegram (@alif_support_alert_bot)...")
 
     offset = 0
