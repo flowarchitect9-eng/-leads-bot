@@ -301,6 +301,27 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9'
 }
 
+async def fetch_single_attempt(session: aiohttp.ClientSession, u: str, timeout_obj) -> Tuple[Optional[str], str, str]:
+    try:
+        async with session.get(u, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
+            if resp.status == 200:
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "text/html" in ct or "application/xhtml" in ct or not ct:
+                    content = await resp.read()
+                    if len(content) > MAX_HTML_SIZE:
+                        content = content[:MAX_HTML_SIZE]
+                    return content.decode("utf-8", errors="ignore"), str(resp.url), "SUCCESS"
+            elif resp.status in (403, 503):
+                return None, u, "BLOCKED_CLOUDFLARE_403"
+            else:
+                return None, u, f"HTTP_{resp.status}"
+    except asyncio.TimeoutError:
+        return None, u, "TIMEOUT"
+    except Exception as e:
+        if "getaddrinfo" in str(e).lower() or "dns" in str(e).lower():
+            return None, u, "DEAD_EXPIRED_DOMAIN"
+        return None, u, "CONNECTION_FAILED"
+
 async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str, str]:
     if not url:
         return None, "", "NO_URL"
@@ -323,34 +344,20 @@ async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> T
         f"http://{www}{path}"
     ]
     seen = set()
-    uniq_attempts = []
-    for a in attempts:
-        if a not in seen:
-            seen.add(a)
-            uniq_attempts.append(a)
+    uniq_attempts = [a for a in attempts if not (a in seen or seen.add(a))]
 
+    tasks = [asyncio.create_task(fetch_single_attempt(session, u, timeout_obj)) for u in uniq_attempts]
     last_diag = "CONNECTION_FAILED"
-    for u in uniq_attempts:
-        try:
-            async with session.get(u, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get("Content-Type", "").lower()
-                    if "text/html" in ct or "application/xhtml" in ct or not ct:
-                        content = await resp.read()
-                        if len(content) > MAX_HTML_SIZE:
-                            content = content[:MAX_HTML_SIZE]
-                        return content.decode("utf-8", errors="ignore"), str(resp.url), "SUCCESS"
-                elif resp.status in (403, 503):
-                    last_diag = "BLOCKED_CLOUDFLARE_403"
-                else:
-                    last_diag = f"HTTP_{resp.status}"
-        except asyncio.TimeoutError:
-            last_diag = "TIMEOUT"
-        except Exception as e:
-            if "getaddrinfo" in str(e).lower() or "dns" in str(e).lower():
-                last_diag = "DEAD_EXPIRED_DOMAIN"
-            else:
-                last_diag = "CONNECTION_FAILED"
+
+    for fut in asyncio.as_completed(tasks):
+        html_c, final_u, diag = await fut
+        if html_c:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return html_c, final_u, "SUCCESS"
+        last_diag = diag
+
     return None, url, last_diag
 
 async def fetch_social_page_emails(session: aiohttp.ClientSession, social_url: str) -> List[Tuple[str, str, int]]:
