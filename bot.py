@@ -418,26 +418,31 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
     email_candidates, existing_phones = harvest_input_row_data(item)
 
     site_host = get_hostname(url) if url else ""
-    if not site_host:
-        comp_name = extract_company_name_from_item(item)
-        if comp_name:
-            clean_dom = re.sub(r'[^a-zA-Z0-9]', '', comp_name).lower()
-            if len(clean_dom) >= 3:
-                site_host = clean_dom + ".com"
-                url = "https://" + site_host
+    comp_name = extract_company_name_from_item(item)
 
     if not url:
+        # Search engine query for company without website
+        if comp_name:
+            search_res = await fetch_search_fallback(session, "", comp_name)
+            if search_res:
+                email_candidates.extend(search_res)
+
         counters["no_url"] += 1
         best_e = email_candidates[0][0] if email_candidates else ""
         best_s = email_candidates[0][1] if email_candidates else ""
+        e_stat = "INPUT_CSV" if "CSV" in best_s or "Body" in best_s else ("SEARCH_CACHE" if best_e else "NO_WEBSITE")
+        best_phone = existing_phones[0] if existing_phones else ""
+        if best_phone:
+            counters["phones"] += 1
+
         return {
             **item,
             "email_found": best_e,
             "email_source": best_s,
-            "email_status": "INPUT_CSV" if best_e else "NO_WEBSITE",
-            "website_issue": "NO_WEBSITE_PROVIDED",
+            "email_status": e_stat,
+            "website_issue": "NO_WEBSITE_PROVIDED" if not best_e else "DISCOVERED_VIA_SEARCH",
             "all_emails_seen": "; ".join([c[0] for c in email_candidates]),
-            "phone_found": existing_phones[0] if existing_phones else "",
+            "phone_found": best_phone,
             "all_phones_seen": "; ".join(existing_phones),
             "title": "", "description": "", "site_name": "", "keywords": "", "language": "",
             "address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found",
