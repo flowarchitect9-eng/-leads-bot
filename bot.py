@@ -302,12 +302,35 @@ HEADERS = {
 }
 
 async def fetch_page(session: aiohttp.ClientSession, url: str, timeout_obj) -> Tuple[Optional[str], str, str]:
-    attempts = [url]
-    if url.startswith("https://"):
-        attempts.append(url.replace("https://", "http://"))
+    if not url:
+        return None, "", "NO_URL"
+
+    clean_u = url.strip()
+    parsed = urllib.parse.urlparse(clean_u if "://" in clean_u else ("https://" + clean_u))
+    domain = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+    if domain.startswith("www."):
+        apex = domain[4:]
+        www = domain
+    else:
+        apex = domain
+        www = "www." + domain
+
+    attempts = [
+        f"https://{apex}{path}",
+        f"https://{www}{path}",
+        f"http://{apex}{path}",
+        f"http://{www}{path}"
+    ]
+    seen = set()
+    uniq_attempts = []
+    for a in attempts:
+        if a not in seen:
+            seen.add(a)
+            uniq_attempts.append(a)
 
     last_diag = "CONNECTION_FAILED"
-    for u in attempts:
+    for u in uniq_attempts:
         try:
             async with session.get(u, headers=HEADERS, timeout=timeout_obj, ssl=False, allow_redirects=True) as resp:
                 if resp.status == 200:
@@ -362,23 +385,46 @@ def extract_company_name_from_item(item: Dict[str, str]) -> str:
     for k, v in item.items():
         lk = k.lower().strip()
         val = str(v or "").strip()
-        if not val:
+        if not val or val == "#ERROR!":
             continue
-        if any(w in lk for w in ['company', 'business name', 'title', 'qbf1pd']):
+        if any(w in lk for w in ['company', 'storename', 'business name', 'title', 'qbf1pd']):
             if not val.startswith(('http', 'www', '{')):
                 return val
     return ""
 
-def harvest_input_row_data(item: Dict[str, str]) -> Tuple[List[Tuple[str, str, int]], List[str]]:
-    """Deeply inspects all columns, whitespace-trimmed headers, and email reply bodies"""
+def harvest_input_row_data(item: Dict[str, str]) -> Tuple[List[Tuple[str, str, int]], List[str], Dict[str, str]]:
+    """Deeply inspects all columns, whitespace-trimmed headers, email reply bodies, and social handles"""
     emails: List[Tuple[str, str, int]] = []
     phones: List[str] = []
+    socials: Dict[str, str] = {"facebook": "", "instagram": "", "linkedin": "", "twitter": ""}
 
     for k, raw_val in item.items():
         val = str(raw_val or "").strip()
-        if not val:
+        if not val or val == "#ERROR!":
             continue
         lk = k.lower().strip()
+
+        # Social columns in CSV
+        if 'facebook' in lk or lk == 'fb':
+            if 'facebook.com' not in val and not val.startswith('http'):
+                socials["facebook"] = f"https://www.facebook.com/{val.lstrip('@')}"
+            else:
+                socials["facebook"] = normalize_url(val)
+        elif 'instagram' in lk or lk == 'ig':
+            if 'instagram.com' not in val and not val.startswith('http'):
+                socials["instagram"] = f"https://www.instagram.com/{val.lstrip('@')}"
+            else:
+                socials["instagram"] = normalize_url(val)
+        elif 'linkedin' in lk:
+            if 'linkedin.com' not in val and not val.startswith('http'):
+                socials["linkedin"] = f"https://www.linkedin.com/company/{val.lstrip('@')}"
+            else:
+                socials["linkedin"] = normalize_url(val)
+        elif 'twitter' in lk or lk == 'x':
+            if 'twitter.com' not in val and 'x.com' not in val and not val.startswith('http'):
+                socials["twitter"] = f"https://twitter.com/{val.lstrip('@')}"
+            else:
+                socials["twitter"] = normalize_url(val)
 
         # 1. Exact email columns (with whitespace trimmed)
         if any(w in lk for w in ['email', 'leademail', 'mail', 'contact']):
@@ -390,7 +436,6 @@ def harvest_input_row_data(item: Dict[str, str]) -> Tuple[List[Tuple[str, str, i
         if any(w in lk for w in ['body', 'message', 'description', 'reply', 'text', 'notes']):
             found_e = RE_EMAIL.findall(val)
             for fe in found_e:
-                # filter out user self-sending addresses if obvious
                 if not any(bad in fe.lower() for bad in ['prospectly', 'prspctio', 'prospectout']):
                     emails.append((fe.strip().lower(), f"Input Body Text [{k.strip()}]", 950))
             found_p = RE_PHONE.findall(val)
@@ -409,13 +454,13 @@ def harvest_input_row_data(item: Dict[str, str]) -> Tuple[List[Tuple[str, str, i
             elif len(re.sub(r'\D', '', val)) >= 7:
                 phones.append(val.strip())
 
-    return emails, phones
+    return emails, phones, socials
 
 async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], counters: Dict) -> Dict[str, str]:
     url, source_col, is_social = pick_website_url(item)
     
     # 1. Exhaustive Input Row Harvester (Source 1-5)
-    email_candidates, existing_phones = harvest_input_row_data(item)
+    email_candidates, existing_phones, input_socials = harvest_input_row_data(item)
 
     site_host = get_hostname(url) if url else ""
     comp_name = extract_company_name_from_item(item)
@@ -427,10 +472,17 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
             if search_res:
                 email_candidates.extend(search_res)
 
+        # Check social pages from input CSV
+        if not email_candidates and (input_socials["facebook"] or input_socials["instagram"]):
+            target_soc = input_socials["facebook"] or input_socials["instagram"]
+            soc_res = await fetch_social_page_emails(session, target_soc)
+            if soc_res:
+                email_candidates.extend(soc_res)
+
         counters["no_url"] += 1
         best_e = email_candidates[0][0] if email_candidates else ""
         best_s = email_candidates[0][1] if email_candidates else ""
-        e_stat = "INPUT_CSV" if "CSV" in best_s or "Body" in best_s else ("SEARCH_CACHE" if best_e else "NO_WEBSITE")
+        e_stat = "INPUT_CSV" if "CSV" in best_s or "Body" in best_s else ("SEARCH_CACHE" if "Search" in best_s else ("VERIFIED_SCRAPED" if "Social" in best_s else "NO_WEBSITE"))
         best_phone = existing_phones[0] if existing_phones else ""
         if best_phone:
             counters["phones"] += 1
@@ -446,7 +498,10 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
             "all_phones_seen": "; ".join(existing_phones),
             "title": "", "description": "", "site_name": "", "keywords": "", "language": "",
             "address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found",
-            "facebook_url": "", "instagram_url": "", "linkedin_url": "", "twitter_url": "",
+            "facebook_url": input_socials["facebook"],
+            "instagram_url": input_socials["instagram"],
+            "linkedin_url": input_socials["linkedin"],
+            "twitter_url": input_socials["twitter"],
             "text_content": "", "source_column_used": "", "final_url": ""
         }
 
@@ -460,10 +515,10 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
     language = ""
     location = {"address_found": "", "city": "", "state": "", "zip": "", "location_source": "not_found"}
     phones = list(dict.fromkeys(existing_phones))
-    facebook_url = ""
-    instagram_url = ""
-    linkedin_url = ""
-    twitter_url = ""
+    facebook_url = input_socials["facebook"]
+    instagram_url = input_socials["instagram"]
+    linkedin_url = input_socials["linkedin"]
+    twitter_url = input_socials["twitter"]
     full_clean_text = ""
     website_issue = "LIVE"
 
@@ -484,16 +539,16 @@ async def process_lead(session: aiohttp.ClientSession, item: Dict[str, str], cou
                     for sube in sub_emails:
                         email_candidates.append((sube, f"Scraped Subpage: {sub_url}", 1100))
 
-        # Social Profiles
+        # Social Profiles from Page
         fb_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:facebook\.com|fb\.me)/[^\'"]+)[\'"]', decoded, re.I)
         ig_m = re.search(r'href=[\'"](https?://(?:www\.)?instagram\.com/[^\'"]+)[\'"]', decoded, re.I)
         li_m = re.search(r'href=[\'"](https?://(?:www\.)?linkedin\.com/(?:company|in)/[^\'"]+)[\'"]', decoded, re.I)
         tw_m = re.search(r'href=[\'"](https?://(?:www\.)?(?:twitter\.com|x\.com)/[^\'"]+)[\'"]', decoded, re.I)
 
-        facebook_url = fb_m.group(1).split('?')[0] if fb_m else ""
-        instagram_url = ig_m.group(1).split('?')[0] if ig_m else ""
-        linkedin_url = li_m.group(1).split('?')[0] if li_m else ""
-        twitter_url = tw_m.group(1).split('?')[0] if tw_m else ""
+        if fb_m: facebook_url = fb_m.group(1).split('?')[0]
+        if ig_m: instagram_url = ig_m.group(1).split('?')[0]
+        if li_m: linkedin_url = li_m.group(1).split('?')[0]
+        if tw_m: twitter_url = tw_m.group(1).split('?')[0]
 
         phones = extract_phones(decoded, existing_phones)
 
